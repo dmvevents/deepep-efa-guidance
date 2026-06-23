@@ -334,13 +334,28 @@
       </div>
       <div class="row blk">
         <div class="when">GDAKI<br>dispatch</div>
-        <div class="what"><b>Kernel-posted WQE — dispatch path</b> <span class="verd no">blocked</span>
-          <p class="mut">Blocked on an unshipped 3-layer stack: rdma-core hardware-counter symbols, libfabric
-          efa-direct counter support (PR open), and the aws-ofi-nccl plugin export. EFA SRD also has no atomics /
-          ordering, which the DOCA put-signal path assumes.</p></div>
+        <div class="what"><b>Kernel-posted WQE — dispatch path</b> <span class="verd no">blocked · 2 gates</span>
+          <p class="mut">Hard-blocked at runtime on a stock p5en (source-verified 2026-06): <b>(1)</b> NCCL's GDAKI
+          backend is <b>IB/RoCE-only by design</b> — EFA needs a brand-new EFA-GDA backend that does not exist publicly
+          yet (NCCL #2090, NVIDIA + AWS "actively working"). <b>(2)</b> The GPU-pollable completion counter it needs is
+          unshipped: the EFA kernel module (efa_linux 3.1.0) has no <code>comp_cntr</code> object and
+          <code>efadv_query_device</code> doesn't report the cap; rdma-core #1701 is open/no-ETA. libfabric #12114 +
+          the plugin <i>compile</i>, but runtime dies at the <code>efadv_create_comp_cntr()</code> ioctl. EFA SRD also
+          has no atomics/ordering, which the accumulating put-signal path assumes. <b>Verdict: park; re-evaluate when
+          an efa_linux release ships completion counters.</b></p></div>
       </div>
       <div class="row near">
-        <div class="when">software<br>near-term</div>
+        <div class="when">software<br>cheapest</div>
+        <div class="what"><b>Free env knob + upstream plugin rebuild</b> <span class="verd tie">untested · testable now</span>
+          <p class="mut"><b>(0)</b> <code>VLLM_MOE_DP_CHUNK_SIZE</code> sweep — the only runtime knob that packs more
+          tokens per transfer (fewer messages = the right lever for an issue-bound fabric); free, no rebuild.
+          <b>(1)</b> rebuild the plugin from <code>aws-ofi-nccl@master</code> (our shipped one is 64 GIN commits behind):
+          commit <code>a698b6e</code> "move signal gdrcopy to a worker thread" takes the receiver read-modify-write
+          off the proxy CQ-drain thread — directly attacks the per-step proxy stall, decode-concentrated. Builds on the
+          CPU-proxy path (no GDAKI gate), ~15&nbsp;min. <span class="pill a">untested; bounded by the 1-SGE cap</span></p></div>
+      </div>
+      <div class="row near">
+        <div class="when">software<br>deeper</div>
         <div class="what"><b>In-plugin K-thread rail driving</b> <span class="verd tie">scoped · GO</span>
           <p class="mut">Shard the proxy <code>iput</code> post path across K dedicated post threads with per-shard
           request pools and a split <code>ep_lock</code> — attacks the issue-bound ceiling in software, no kernel
