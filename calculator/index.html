@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>DeepEP-on-EFA Calculator — should I use DeepEP all-to-all, or a dense/allgather alternative?</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --ink:#e8ecf4; --mut:#9aa4b8;
+    --line:#2a3040; --accent:#6ea8fe; --good:#46c98b; --warn:#f0b357; --bad:#ef6f6f; --cost:#7aa2ff;
+    --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{padding:28px 22px 14px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#141826,#0f1117)}
+  h1{font-size:22px;margin:0 0 6px}
+  h2{font-size:16px;margin:26px 0 10px;color:var(--accent);letter-spacing:.2px}
+  h3{font-size:14px;margin:16px 0 6px}
+  .sub{color:var(--mut);max-width:880px}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px 60px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  label{display:block;font-size:12px;color:var(--mut);margin:10px 0 3px}
+  input,select{width:100%;background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:8px;font:13px var(--mono)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+  button{margin-top:16px;background:var(--accent);color:#08101f;border:0;border-radius:8px;padding:11px 16px;font-weight:700;font-size:14px;cursor:pointer;width:100%}
+  button:hover{filter:brightness(1.08)}
+  .verdict{margin-top:18px;padding:18px;border-radius:10px;border:1px solid var(--line);background:var(--panel2)}
+  .verdict.big{font-size:20px;font-weight:800}
+  .pill{display:inline-block;font:10px var(--mono);padding:1px 6px;border-radius:5px;margin-left:6px;vertical-align:middle;text-transform:uppercase;letter-spacing:.5px}
+  .m{background:#1b3a2c;color:var(--good)}      /* MEASURED */
+  .d{background:#1d2c4a;color:var(--cost)}      /* DERIVED */
+  .a{background:#3a3119;color:var(--warn)}      /* ASSUMED */
+  table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:right}
+  th{background:var(--panel2);color:var(--mut);font-weight:600}
+  td:first-child,th:first-child{text-align:left}
+  .good{color:var(--good)} .bad{color:var(--bad)} .warn{color:var(--warn)} .mut{color:var(--mut)}
+  code{font:12px var(--mono);background:#11141d;padding:1px 5px;border-radius:4px;color:#c9d4ea}
+  .cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:10px}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:14px}
+  .card .glyph{font-size:20px}
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .is{border-left:3px solid var(--good);padding-left:12px}
+  .isnot{border-left:3px solid var(--bad);padding-left:12px}
+  ul{margin:6px 0;padding-left:20px} li{margin:3px 0}
+  .bar{height:18px;border-radius:4px;background:linear-gradient(90deg,var(--accent),#9b7bff)}
+  .barbg{background:#11141d;border-radius:4px;border:1px solid var(--line);overflow:hidden;margin:3px 0}
+  .foot{color:var(--mut);font-size:12px;margin-top:30px;border-top:1px solid var(--line);padding-top:14px}
+  .legend{font-size:11px;color:var(--mut);margin-top:6px}
+  .warnbox{background:#2a1f12;border:1px solid #4a3a1c;border-radius:8px;padding:12px;color:#f0d9b0;margin-top:12px}
+  .asciidiag{font:11px/1.35 var(--mono);background:#0b0e15;border:1px solid var(--line);border-radius:8px;padding:12px;color:#9fb3d8;white-space:pre;overflow-x:auto}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap" style="padding-bottom:0">
+    <h1>DeepEP-on-EFA Calculator <span class="pill m">measured-calibrated</span></h1>
+    <p class="sub">Should you run a Mixture-of-Experts model with <b>DeepEP expert-parallel all-to-all</b>, or a
+    <b>dense / allgather alternative</b>, on AWS EFA (p5en, CPU-proxy NCCL-GIN)? This tool works from the
+    <i>measured</i> behaviour of DeepEP-V2 on EFA — not vendor spec sheets — and tells you, for your model + workload,
+    whether the expert-parallel all-to-all helps or hurts your serving throughput.
+    Every output carries a <span class="pill m">measured</span> / <span class="pill d">derived</span> /
+    <span class="pill a">assumed</span> provenance tag.</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="grid">
+    <div class="panel">
+      <h2>§1 · Model + expert config</h2>
+      <label>Preset (verified HF config.json)</label>
+      <select id="preset" onchange="applyPreset()">
+        <option value="qwen3-30b">Qwen3-30B-A3B-FP8 (calibration point — MEASURED)</option>
+        <option value="dsv2lite">DeepSeek-V2-Lite (64 experts)</option>
+        <option value="qwen3-235b">Qwen3-235B-A22B</option>
+        <option value="mixtral8x7b">Mixtral 8x7B</option>
+        <option value="custom">custom…</option>
+      </select>
+      <div class="row">
+        <div><label>num experts</label><input id="experts" type="number" value="128"></div>
+        <div><label>top-k</label><input id="topk" type="number" value="8"></div>
+      </div>
+      <div class="row">
+        <div><label>hidden dim</label><input id="hidden" type="number" value="2048"></div>
+        <div><label>weight dtype</label>
+          <select id="dtype"><option>fp8</option><option>bf16</option><option>fp4</option></select></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>§2 · Topology + workload + targets</h2>
+      <label>Serving framework + alternative you'd compare against</label>
+      <select id="fw" onchange="derive()">
+        <option value="trt">TRT-LLM — DeepEP vs its dense allgather (MEASURED 0.60–0.69×)</option>
+        <option value="vllm">vLLM — deepep_v2 vs allgather_reducescatter (MEASURED ~TIE 0.97–1.03×)</option>
+        <option value="sglang">SGLang — DeepEP-V2 vs UCCL transport (MEASURED ~TIE 1.03×)</option>
+      </select>
+      <div class="row">
+        <div><label>EP degree (GPUs across experts)</label><input id="ep" type="number" value="16"></div>
+        <div><label>GPUs / node</label><input id="gpn" type="number" value="8"></div>
+      </div>
+      <div class="row3">
+        <div><label>concurrency</label><input id="conc" type="number" value="32"></div>
+        <div><label>input len (ISL)</label><input id="isl" type="number" value="2048"></div>
+        <div><label>output len (OSL)</label><input id="osl" type="number" value="128"></div>
+      </div>
+      <div class="row">
+        <div><label>instance $/hr (8-GPU)</label><input id="cost" type="number" value="40.0" step="0.1"></div>
+        <div><label>SLO per-user tok/s (floor)</label><input id="slo" type="number" value="15"></div>
+      </div>
+      <label><input type="checkbox" id="multicomm" checked style="width:auto;margin-right:6px">DeepEP runs with EP_NUM_COMMS=8 (multi-comm — the recommended surpass knob)</label>
+      <label><input type="checkbox" id="capacity" style="width:auto;margin-right:6px">Model does NOT fit without sharding experts (capacity-forced)</label>
+      <button onclick="derive()">Derive ▸</button>
+    </div>
+  </div>
+
+  <div id="out"></div>
+
+  <h2>§3 · The three verdicts</h2>
+  <div class="cards">
+    <div class="card"><div class="glyph">■</div><b>Use DENSE / allgather</b>
+      <p class="mut">EP all-to-all is not the bottleneck at your scale. On EFA's CPU-proxy path the per-decode-step
+      proxy round-trip costs more than the expert-volume it saves. Default for EP≤16 serving.</p></div>
+    <div class="card"><div class="glyph">◆</div><b>Use DeepEP for CAPACITY</b>
+      <p class="mut">Model doesn't fit / KV-cache starved without sharding experts. Use DeepEP (or any EP) to fit —
+      accept the all-to-all toll because the alternative is OOM, not a slower-but-working serve.</p></div>
+    <div class="card"><div class="glyph">▲</div><b>DeepEP wins on throughput</b>
+      <p class="mut">Only when GPU-initiated transport (GDAKI/IBGDA) removes the per-step proxy tax — <b>not viable on
+      EFA today</b> (SRD has no atomics/ordering; the kernel-posted-WQE dispatch path is upstream-gated).</p></div>
+  </div>
+
+  <h2>§4 · What this tool is — and is not</h2>
+  <div class="twocol">
+    <div class="is"><b>IS</b>
+      <ul>
+        <li>Calibrated to a <b>measured</b> fair A/B: DeepEP-V2 (EP_NUM_COMMS=8 multi-comm) vs dense allgather,
+          same model/build/nodes, EP16, 2× p5en EFA, AIPerf 0.10.0.</li>
+        <li>A decision aid for <b>EFA / CPU-proxy NCCL-GIN</b> (NCCL_GIN_TYPE=2, ElasticBuffer).</li>
+        <li>Honest about the <b>fixed per-decode-step proxy tax</b> that load-invariantly handicaps DeepEP here.</li>
+      </ul>
+    </div>
+    <div class="isnot"><b>IS NOT</b>
+      <ul>
+        <li>A claim about InfiniBand / NVLink-only / MNNVL clusters — there DeepEP + IBGDA can win; this is EFA.</li>
+        <li>A correctness statement — both arms produce identical coherent output; this is about throughput/$.</li>
+        <li>A ≥2-rep statistical study — headline cells are n=1; cross-regime ratio tightness (σ small) is the
+          evidence. See provenance tags.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="warnbox" id="calib"></div>
+
+  <h2>§5 · Why — the mechanism (measured)</h2>
+  <div class="asciidiag" id="diag"></div>
+  <p class="legend">The CPU-proxy posts each cross-node expert dispatch via the host (D2H ring → CPU proxy →
+  libfabric fi_writedata → EFA SRD). At ~2.2% NIC utilization the path is <b>issue-bound</b> (per-op post rate),
+  not wire-bound — so reducing all-to-all <i>bytes</i> (DeepEP's O(top-k) advantage) doesn't reduce the per-step
+  <i>latency</i> that gates decode tok/s. GPU-initiated transport (GDAKI) would post the WQE from the kernel and
+  remove the host round-trip — that is the only path measured to change the verdict, and it is not available on
+  EFA SRD today.</p>
+
+</div>
+
+<script>
+// ---- MEASURED calibration constants (efa-gda campaign, 2026-06; sourced in MEASURED-DATA.md) ----
+const CAL = {
+  deepep_per_user: 19.62,   // tok/s flat across conc4/32 + ISL120/2048 (sigma 0.13)   MEASURED
+  dense_per_user:  27.57,   // tok/s flat (sigma 0.51)                                  MEASURED
+  proxy_tax_ms: 14.7,       // = 1000/19.62 - 1000/27.57 = 51.0-36.3 ms/token          DERIVED
+  efa_nic_gbps: 25.0, efa_nics_per_node: 16, nic_util: 0.022, dispatch_so_prefill: 33  // MEASURED
+};
+// framework-specific measured DeepEP/alternative serving ratio (decode agg tok/s)
+const FW = {
+  trt:    {alt:"dense allgather (TRTLLM_MOE_DISABLE_ALLTOALLV)", ratio:0.67, deepep_pu:19.62, alt_pu:27.57,
+           note:"TRT-LLM's dense path is fast → DeepEP loses ~1.5× (0.60–0.69× measured across conc4/32/ISL2048)."},
+  vllm:   {alt:"allgather_reducescatter", ratio:0.97, deepep_pu:18.5, alt_pu:19.0,
+           note:"vLLM's allgather is heavier → DeepEP-V2 (EPNC8) TIES it (0.97× decode, 1.00–1.02× at EP32). Prefill 0.80×."},
+  sglang: {alt:"UCCL transport", ratio:1.03, deepep_pu:8.6, alt_pu:8.3,
+           note:"DeepEP-V2 vs UCCL: statistical TIE (1.03× agg, ~3% faster ITL) despite UCCL ~4× faster transport microbench."}
+};
+const PRESETS = {
+  "qwen3-30b":{experts:128,topk:8,hidden:2048,dtype:"fp8"},
+  "dsv2lite":{experts:64,topk:6,hidden:2048,dtype:"bf16"},
+  "qwen3-235b":{experts:128,topk:8,hidden:4096,dtype:"fp8"},
+  "mixtral8x7b":{experts:8,topk:2,hidden:4096,dtype:"bf16"}
+};
+function applyPreset(){
+  const p=PRESETS[document.getElementById('preset').value]; if(!p)return;
+  experts.value=p.experts; topk.value=p.topk; hidden.value=p.hidden; dtype.value=p.dtype;
+}
+const $=id=>document.getElementById(id);
+const f=(x,d=1)=>Number(x).toFixed(d);
+
+function derive(){
+  const ep=+$('ep').value, gpn=+$('gpn').value, conc=+$('conc').value;
+  const isl=+$('isl').value, osl=+$('osl').value, cost=+$('cost').value, slo=+$('slo').value;
+  const fw=FW[$('fw').value], mc=$('multicomm').checked, capForced=$('capacity').checked;
+  const nodes=Math.max(1,Math.ceil(ep/gpn));
+  const crossNode = nodes>1;
+
+  // --- per-user model: framework-specific MEASURED ratio; intra-node = parity (NVLink, no EFA tax) ---
+  const alt_pu = fw.alt_pu;
+  let deepep_pu = crossNode ? fw.deepep_pu : alt_pu*0.98;
+  if(crossNode && !mc) deepep_pu *= 0.5;  // single-comm = the 8 GB/s slow path (EPNC1 ~2x slower, measured 142 vs 296)
+  const dense_pu = alt_pu;
+  const ratio = deepep_pu/dense_pu;
+  // aggregate ~ per-user * effective concurrency (both arms scale similarly; ratio preserved) DERIVED
+  const dense_agg = dense_pu*conc;
+  const deepep_agg = deepep_pu*conc;
+
+  // --- $/Mtok DERIVED ---
+  const instCost = cost*nodes/gpn*ep/8; // approx $/hr for the EP job
+  const dollarsPerMtok = a => instCost/3600 / (a) * 1e6; // $/hr / (tok/s) -> $/Mtok... simplify
+  const dpm = a => (instCost/(a*3600))*1e6;
+  const dense_dpm = dpm(dense_agg), deepep_dpm = dpm(deepep_agg);
+
+  // --- verdict ---
+  let verdict, vclass, glyph, why;
+  if(capForced){
+    verdict="Use DeepEP / EP — CAPACITY forces it"; vclass="warn"; glyph="◆";
+    why=`Model doesn't fit without sharding experts. A working serve at ${f(deepep_pu)} tok/s beats OOM. `+
+        `Note: that is an <b>EP-itself</b> win (allgather-EP has it too), not a DeepEP-all-to-all throughput win.`;
+  } else if(!crossNode){
+    verdict="DeepEP ≈ alternative (intra-node) — either works"; vclass="warn"; glyph="◆";
+    why="EP fits in one node: all-to-all rides NVLink, no EFA proxy tax. Pick on operational simplicity.";
+  } else if(crossNode && !mc){
+    verdict="Turn ON EP_NUM_COMMS=8 first — you're on the slow path"; vclass="bad"; glyph="■";
+    why=`Single-comm DeepEP is the ~8 GB/s issue-bound path (measured 2× slower: vLLM 142 vs 296 tok/s). `+
+        `Enable multi-comm before any comparison — it's the recommended way to RUN DeepEP on EFA.`;
+  } else if(ratio>=0.92){
+    verdict=`DeepEP ≈ ${fw.alt} — TIE on serving`; vclass="warn"; glyph="◆";
+    why=`On ${$('fw').value.toUpperCase()}, DeepEP-V2 ties its alternative (${f(ratio,2)}× measured). The all-to-all is `+
+        `not the serving critical path here, so DeepEP neither helps nor hurts tok/s — pick on robustness/ops. `+fw.note;
+  } else if(deepep_pu < slo && dense_pu >= slo){
+    verdict="Use the ALTERNATIVE — DeepEP misses your per-user SLO on EFA"; vclass="bad"; glyph="■";
+    why=`DeepEP per-user ${f(deepep_pu)} tok/s < SLO ${slo}; ${fw.alt} ${f(dense_pu)} clears it.`;
+  } else {
+    verdict=`Use ${fw.alt} for throughput on EFA`; vclass="bad"; glyph="■";
+    why=`The alternative is ${f(1/ratio,2)}× faster on the EFA CPU-proxy path (measured ${f(ratio,2)}× DeepEP/alt). `+
+        `The +${CAL.proxy_tax_ms} ms/token proxy round-trip is load-invariant and exceeds the all-to-all byte savings at EP${ep}. `+fw.note;
+  }
+  const capNote = capForced ? "" : `If your model does <b>not fit</b> without sharding experts (KV-cache starved), tick the
+    capacity box — then DeepEP/EP is the right call regardless of the throughput ratio (working serve &gt; OOM).`;
+
+  $('out').innerHTML = `
+  <h2>Verdict</h2>
+  <div class="verdict big ${vclass}">${glyph} ${verdict} <span class="pill d">derived</span></div>
+  <p class="mut" style="margin-top:8px">${why}</p>
+  <div class="warnbox">${capNote}</div>
+
+  <h3>Serving throughput — DeepEP vs dense <span class="pill ${crossNode?'m':'a'}">${crossNode?'measured-calibrated':'assumed intra-node'}</span></h3>
+  <table>
+    <tr><th>metric</th><th>DeepEP (a2a)</th><th>dense (allgather)</th><th>DeepEP / dense</th></tr>
+    <tr><td>per-user tok/s</td><td>${f(deepep_pu)}</td><td>${f(dense_pu)}</td><td class="${ratio<0.9?'bad':ratio>1.1?'good':'warn'}">${f(ratio,2)}×</td></tr>
+    <tr><td>aggregate tok/s @ conc ${conc}</td><td>${f(deepep_agg)}</td><td>${f(dense_agg)}</td><td class="${ratio<0.9?'bad':'warn'}">${f(ratio,2)}×</td></tr>
+    <tr><td>decode latency / token (ms)</td><td>${f(1000/deepep_pu)}</td><td>${f(1000/dense_pu)}</td><td class="bad">+${f(1000/deepep_pu-1000/dense_pu)} ms</td></tr>
+    <tr><td>$ / Mtok</td><td>$${f(deepep_dpm,2)}</td><td>$${f(dense_dpm,2)}</td><td class="${ratio<0.9?'bad':'warn'}">${f(deepep_dpm/dense_dpm,2)}×</td></tr>
+  </table>
+  <p class="legend">per-user values are <span class="pill m">measured</span> (Qwen3-30B EP16 on 2× p5en EFA); aggregate &amp; $/Mtok
+  are <span class="pill d">derived</span> by scaling. Capacity-fit is <span class="pill a">assumed</span> — verify against your GPU memory.</p>
+
+  <h3>Bandwidth bar (why bytes ≠ throughput)</h3>
+  <div class="barbg"><div class="bar" style="width:${Math.min(100,CAL.nic_util*100*20)}%"></div></div>
+  <p class="legend">EFA NIC utilization on the DeepEP dispatch path ≈ <b>${f(CAL.nic_util*100,1)}%</b> (issue-bound).
+  DeepEP cuts all-to-all <i>bytes</i> (33 GB/s SO measured) but the wire is 95%+ idle — the limit is per-op
+  <i>post rate</i> through the host proxy, which dense doesn't pay per decode step. <span class="pill m">measured</span></p>
+  `;
+  renderDiag(crossNode,ep,nodes);
+}
+
+function renderDiag(crossNode,ep,nodes){
+  $('diag').textContent = crossNode ?
+`  DeepEP cross-node dispatch (EP${ep}, ${nodes} nodes)        dense allgather (EP${ep})
+  GPU kernel                                       GPU kernel
+    │ token routing                                  │
+    ▼                                                ▼  (NVLink intra + small EFA allgather)
+  D2H ring ──► CPU proxy ──► libfabric ──► EFA SRD   NVLink/NCCL collective
+    └──────────── +14.7 ms/token ───────────┘        └── ~0 added proxy tax ──┘
+  per decode STEP, load-invariant  ◄── the tax        amortized, no per-step host round-trip` :
+`  EP${ep} fits in ${nodes} node — all-to-all rides NVLink.
+  No EFA proxy on the data path; DeepEP ≈ dense. Pick on simplicity.`;
+}
+
+// calibration banner + first render
+document.addEventListener('DOMContentLoaded',()=>{
+  $('calib').innerHTML = `<b>⚠ Calibration point (MEASURED):</b> Qwen3-30B-A3B-FP8, EP16, 2× p5en.48xlarge (16 EFA NICs/node),
+   DeepEP-V2 ElasticBuffer + EP_NUM_COMMS=8 (multi-comm) vs dense allgather, identical build/nodes, AIPerf 0.10.0.
+   DeepEP/dense aggregate tok/s = <b>0.65× (conc4) · 0.69× (conc32) · 0.67× (conc16/ISL2048)</b>.
+   Multi-comm 4×'d transport <i>bytes</i> but did <b>not</b> change serving tok/s. The proxy tax (+14.7 ms/token) is
+   constant across all three regimes — that constancy is the evidence it is a fixed per-step cost, not noise.`;
+  applyPreset(); derive();
+});
+</script>
+</body>
+</html>

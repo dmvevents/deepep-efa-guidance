@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§5 · The alternatives — UCCL, pplx, dense allgather, GDAKI: do they serve, and how fast? — DeepEP-on-EFA</title>
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<header class="site">
+  <span class="brand">DeepEP-on-EFA Guidance</span>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">1·MoE</a>
+    <a href="02-efa-vs-infiniband.html">2·EFA vs IB</a>
+    <a href="03-scaling.html">3·Scaling</a>
+    <a href="04-microbenchmarks.html">4·Benchmarks</a>
+    <a href="05-alternatives.html" style="color:var(--ink)">5·Alternatives</a>
+    <a href="06-solution-arch.html">6·Architecture</a>
+    <a href="../calculator/">▸ Calculator</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <h1>§5 · The alternatives — do they serve on EFA, and how fast?</h1>
+  <p class="sub">DeepEP is one way to do Mixture-of-Experts all-to-all. There are five paths a serving
+  stack can take on AWS EFA today. This section surveys each one with the same four questions:
+  <b>what is it</b>, <b>does inference actually serve on EFA</b> (yes / no / with-what), <b>what did we
+  measure</b>, and <b>when would you pick it</b>. Everything tagged
+  <span class="pill m">measured</span> ran on the efa-gda campaign — 2× p5en.48xlarge, 16 EFA NICs/node,
+  Qwen3-30B-A3B-FP8 EP16 unless noted — not vendor spec sheets.</p>
+
+  <div class="warnbox">
+    <b>The one-line answer, up front.</b> On EFA <i>today</i>, for <b>serving throughput</b>: pick
+    <b>dense allgather</b> (fastest on TRT-LLM, <span class="pill m">1.5×</span> over DeepEP) or
+    <b>DeepEP multi-comm / allgather</b> where they tie (vLLM, SGLang). <b>UCCL</b> and <b>pplx</b> are
+    research comparators — UCCL needs a fork and ties DeepEP on serving despite a 4× transport edge; pplx
+    has no serving adapter. DeepEP's genuine win is <b>model capacity</b> plus a <b>future GDAKI</b> path
+    that EFA cannot run yet.
+  </div>
+
+  <!-- ============================ THE DECISION MATRIX (lead visual) ============================ -->
+  <h2>The decision matrix — five paths, one glance</h2>
+  <p class="sub">Rows are the all-to-all alternatives. Read left-to-right: does it serve on EFA, how fast is
+  the transport, how fast is end-to-end serving, does it need a code fork, and the one-line "pick it when".
+  Green = yes / fast / no-fork. Amber = ties / caveat. Red = no / slow / blocker.</p>
+
+  <svg viewBox="0 0 1040 372" role="img" aria-label="Decision matrix comparing dense allgather, DeepEP-V2, UCCL, pplx and GDAKI across serves-on-EFA, transport speed, serving speed, needs-a-fork and when-to-pick">
+    <defs>
+      <linearGradient id="hd" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#1e2230"/><stop offset="1" stop-color="#161a25"/>
+      </linearGradient>
+    </defs>
+    <rect x="0" y="0" width="1040" height="372" fill="#0b0e15"/>
+
+    <!-- column header band -->
+    <rect x="14" y="14" width="1012" height="34" rx="6" fill="url(#hd)" stroke="#2a3040"/>
+    <text x="26"  y="36" fill="#e8ecf4" font-family="sans-serif" font-size="13" font-weight="700">path</text>
+    <text x="250" y="36" fill="#9aa4b8" font-family="sans-serif" font-size="12">serves on EFA?</text>
+    <text x="430" y="36" fill="#9aa4b8" font-family="sans-serif" font-size="12">transport speed</text>
+    <text x="600" y="36" fill="#9aa4b8" font-family="sans-serif" font-size="12">serving speed</text>
+    <text x="770" y="36" fill="#9aa4b8" font-family="sans-serif" font-size="12">needs a fork?</text>
+    <text x="880" y="36" fill="#9aa4b8" font-family="sans-serif" font-size="12">pick it when…</text>
+
+    <!-- ROW 1 — DENSE -->
+    <g font-family="sans-serif" font-size="12.5">
+      <rect x="14" y="54" width="1012" height="56" rx="6" fill="#141826" stroke="#2a3040"/>
+      <rect x="14" y="54" width="4" height="56" rx="2" fill="#46c98b"/>
+      <text x="30" y="78" fill="#e8ecf4" font-weight="700">Dense / allgather</text>
+      <text x="30" y="96" fill="#9aa4b8" font-size="11">the "no-DeepEP" baseline</text>
+      <!-- serves -->
+      <circle cx="262" cy="82" r="8" fill="#46c98b"/><text x="276" y="86" fill="#46c98b" font-weight="700">YES</text>
+      <text x="276" y="100" fill="#9aa4b8" font-size="10.5">no special transport</text>
+      <!-- transport -->
+      <text x="430" y="80" fill="#9aa4b8">N/A (O(N) volume)</text>
+      <text x="430" y="98" fill="#9aa4b8" font-size="10.5">NVLink + small EFA</text>
+      <!-- serving -->
+      <circle cx="612" cy="82" r="8" fill="#46c98b"/><text x="626" y="86" fill="#46c98b" font-weight="700">FASTEST</text>
+      <text x="626" y="100" fill="#9aa4b8" font-size="10.5">TRT 1.5× over DeepEP</text>
+      <!-- fork -->
+      <circle cx="782" cy="82" r="8" fill="#46c98b"/><text x="796" y="86" fill="#46c98b" font-weight="700">NO</text>
+      <!-- pick -->
+      <text x="880" y="80" fill="#e8ecf4" font-size="11.5">EP≤16 serving,</text>
+      <text x="880" y="96" fill="#e8ecf4" font-size="11.5">default choice</text>
+    </g>
+
+    <!-- ROW 2 — DEEPEP -->
+    <g font-family="sans-serif" font-size="12.5">
+      <rect x="14" y="116" width="1012" height="56" rx="6" fill="#141826" stroke="#2a3040"/>
+      <rect x="14" y="116" width="4" height="56" rx="2" fill="#6ea8fe"/>
+      <text x="30" y="140" fill="#e8ecf4" font-weight="700">DeepEP-V2 (ElasticBuffer)</text>
+      <text x="30" y="158" fill="#9aa4b8" font-size="11">NCCL-GIN CPU-proxy · the subject</text>
+      <circle cx="262" cy="144" r="8" fill="#46c98b"/><text x="276" y="148" fill="#46c98b" font-weight="700">YES</text>
+      <text x="276" y="162" fill="#9aa4b8" font-size="10.5">GIN_TYPE=2 proxy</text>
+      <circle cx="442" cy="144" r="8" fill="#46c98b"/><text x="456" y="148" fill="#46c98b" font-weight="700">GOOD</text>
+      <text x="456" y="162" fill="#9aa4b8" font-size="10.5">33 SO · 1.45× UCCL-pub</text>
+      <circle cx="612" cy="144" r="8" fill="#f0b357"/><text x="626" y="148" fill="#f0b357" font-weight="700">TIE</text>
+      <text x="626" y="162" fill="#9aa4b8" font-size="10.5">parity w/ allgather</text>
+      <circle cx="782" cy="144" r="8" fill="#46c98b"/><text x="796" y="148" fill="#46c98b" font-weight="700">NO</text>
+      <text x="880" y="138" fill="#e8ecf4" font-size="11.5">capacity, or a</text>
+      <text x="880" y="154" fill="#e8ecf4" font-size="11.5">working drop-in</text>
+    </g>
+
+    <!-- ROW 3 — UCCL -->
+    <g font-family="sans-serif" font-size="12.5">
+      <rect x="14" y="178" width="1012" height="56" rx="6" fill="#141826" stroke="#2a3040"/>
+      <rect x="14" y="178" width="4" height="56" rx="2" fill="#b07bff"/>
+      <text x="30" y="202" fill="#e8ecf4" font-weight="700">UCCL</text>
+      <text x="30" y="220" fill="#9aa4b8" font-size="11">raw-ibverbs a2a wrapper</text>
+      <circle cx="262" cy="206" r="8" fill="#f0b357"/><text x="276" y="210" fill="#f0b357" font-weight="700">PARTIAL</text>
+      <text x="276" y="224" fill="#9aa4b8" font-size="10.5">SGLang yes · vLLM no</text>
+      <circle cx="442" cy="206" r="8" fill="#46c98b"/><text x="456" y="210" fill="#46c98b" font-weight="700">FASTEST</text>
+      <text x="456" y="224" fill="#9aa4b8" font-size="10.5">47µs · ~4× microbench</text>
+      <circle cx="612" cy="206" r="8" fill="#f0b357"/><text x="626" y="210" fill="#f0b357" font-weight="700">TIE</text>
+      <text x="626" y="224" fill="#9aa4b8" font-size="10.5">1.03× vs DeepEP</text>
+      <circle cx="782" cy="206" r="8" fill="#ef6f6f"/><text x="796" y="210" fill="#ef6f6f" font-weight="700">YES</text>
+      <text x="880" y="200" fill="#e8ecf4" font-size="11.5">research compare,</text>
+      <text x="880" y="216" fill="#e8ecf4" font-size="11.5">long-prefill edge</text>
+    </g>
+
+    <!-- ROW 4 — PPLX -->
+    <g font-family="sans-serif" font-size="12.5">
+      <rect x="14" y="240" width="1012" height="56" rx="6" fill="#141826" stroke="#2a3040"/>
+      <rect x="14" y="240" width="4" height="56" rx="2" fill="#9aa4b8"/>
+      <text x="30" y="264" fill="#e8ecf4" font-weight="700">pplx (perplexity-garden)</text>
+      <text x="30" y="282" fill="#9aa4b8" font-size="11">kernel-level a2a</text>
+      <circle cx="262" cy="268" r="8" fill="#ef6f6f"/><text x="276" y="272" fill="#ef6f6f" font-weight="700">NO SERVE</text>
+      <text x="276" y="286" fill="#9aa4b8" font-size="10.5">no adapter</text>
+      <circle cx="442" cy="268" r="8" fill="#46c98b"/><text x="456" y="272" fill="#46c98b" font-weight="700">GOOD</text>
+      <text x="456" y="286" fill="#9aa4b8" font-size="10.5">222µs / 362µs</text>
+      <text x="612" y="266" fill="#9aa4b8">— (comparator)</text>
+      <text x="612" y="284" fill="#9aa4b8" font-size="10.5">not a serving path</text>
+      <text x="782" y="266" fill="#9aa4b8">n/a</text>
+      <text x="880" y="264" fill="#e8ecf4" font-size="11.5">transport bench</text>
+      <text x="880" y="280" fill="#e8ecf4" font-size="11.5">only</text>
+    </g>
+
+    <!-- ROW 5 — GDAKI -->
+    <g font-family="sans-serif" font-size="12.5">
+      <rect x="14" y="302" width="1012" height="56" rx="6" fill="#1a1410" stroke="#4a3a1c"/>
+      <rect x="14" y="302" width="4" height="56" rx="2" fill="#ff8a5c"/>
+      <text x="30" y="326" fill="#f0d9b0" font-weight="700">IBGDA / GDAKI</text>
+      <text x="30" y="344" fill="#c8a98a" font-size="11">GPU-initiated · the unlock</text>
+      <circle cx="262" cy="330" r="8" fill="#ef6f6f"/><text x="276" y="334" fill="#ef6f6f" font-weight="700">NO</text>
+      <text x="276" y="348" fill="#c8a98a" font-size="10.5">SRD: no atomics/order</text>
+      <text x="430" y="328" fill="#c8a98a">would be best</text>
+      <text x="430" y="346" fill="#c8a98a" font-size="10.5">removes proxy tax</text>
+      <circle cx="612" cy="330" r="8" fill="#ff8a5c"/><text x="626" y="334" fill="#ff8a5c" font-weight="700">WOULD WIN</text>
+      <text x="626" y="348" fill="#c8a98a" font-size="10.5">IB-only today</text>
+      <text x="782" y="328" fill="#c8a98a">3 unshipped</text>
+      <text x="782" y="346" fill="#c8a98a" font-size="10.5">upstream layers</text>
+      <text x="880" y="326" fill="#f0d9b0" font-size="11.5">on InfiniBand,</text>
+      <text x="880" y="342" fill="#f0d9b0" font-size="11.5">not EFA (yet)</text>
+    </g>
+  </svg>
+  <p class="legend">Verdict colours: <span class="good">●&nbsp;yes / fast / no-fork</span> &nbsp;
+    <span class="warn">●&nbsp;ties / caveat / partial</span> &nbsp;
+    <span class="bad">●&nbsp;no / blocker / fork-required</span>.
+    "transport speed" = dispatch/combine microbench (bytes-on-the-wire); "serving speed" = end-to-end
+    aggregate tok/s. The two columns disagree on purpose — that disagreement is the whole story of this section.</p>
+
+  <!-- ============================ 1. DENSE ============================ -->
+  <h2>1 · Dense / allgather — the "no-DeepEP" baseline</h2>
+  <div class="twocol">
+    <div class="panel">
+      <h3>What it is</h3>
+      <p>Skip the expert-parallel all-to-all entirely. Each rank gathers <i>every</i> token
+      (<code>allgather</code>), every rank runs every expert it owns, then a <code>reduce-scatter</code>
+      returns the results. O(N) communication volume per GPU instead of DeepEP's O(top-k) — but it rides
+      NVLink intra-node and a small EFA collective cross-node, with <b>no special transport stack</b>.
+      In the frameworks: <code>TRTLLM_MOE_DISABLE_ALLTOALLV</code> (TRT-LLM) or
+      <code>--all2all-backend allgather_reducescatter</code> (vLLM).</p>
+    </div>
+    <div class="panel">
+      <h3>Does it serve on EFA?</h3>
+      <p class="good"><b>Yes — everywhere, no caveats.</b> It is the path that needs nothing: no GIN plugin,
+      no ElasticBuffer, no QP-cap tuning, no proxy. If a framework runs on the box, this runs.</p>
+      <h3>When to pick it</h3>
+      <p>This is the <b>default recommendation for EP≤16 serving on EFA.</b> Reach for DeepEP only when a
+      measurement or a capacity constraint says you should — not by default.</p>
+    </div>
+  </div>
+  <table>
+    <tr><th>measured A/B (same framework, same model/nodes, EP16)</th><th>DeepEP agg tok/s</th><th>dense agg tok/s</th><th>DeepEP / dense</th></tr>
+    <tr><td>TRT-LLM 0.21 · conc4 / ISL120</td><td>68.7</td><td>105.66</td><td class="bad">0.65×</td></tr>
+    <tr><td>TRT-LLM 0.21 · conc32 / ISL120</td><td>545.04</td><td>794.56</td><td class="bad">0.69×</td></tr>
+    <tr><td>vLLM · conc32 / decode</td><td>296</td><td>304</td><td class="warn">0.97× (tie)</td></tr>
+    <tr><td>vLLM · conc64 / prefill</td><td>18201</td><td>22797</td><td class="bad">0.80×</td></tr>
+  </table>
+  <p class="legend"><span class="pill m">measured</span> Dense is <b>1.5× faster than DeepEP on TRT-LLM</b>
+  and <b>ties DeepEP on vLLM</b>. There is no measured serving regime on EFA where DeepEP beats dense —
+  best case is a tie. That single fact is why dense is the default.</p>
+
+  <!-- ============================ 2. DEEPEP ============================ -->
+  <h2>2 · DeepEP-V2 (ElasticBuffer, NCCL-GIN CPU-proxy) — the subject</h2>
+  <div class="twocol">
+    <div class="panel">
+      <h3>What it is</h3>
+      <p>DeepSeek's expert-parallel all-to-all, V2 generation. On EFA it runs through
+      <code>deep_ep.ElasticBuffer</code> over the NCCL-GIN <b>CPU-proxy</b> path
+      (<code>NCCL_GIN_TYPE=2</code>) — <i>not</i> the IBGDA/NVSHMEM path the upstream
+      <code>deep_ep.Buffer</code> assumes, which EFA cannot run (no atomics, no ordering on SRD). The
+      proxy posts each cross-node dispatch via the host: D2H ring → CPU proxy → libfabric
+      <code>fi_writedata</code> → EFA SRD.</p>
+    </div>
+    <div class="panel">
+      <h3>Does it serve on EFA?</h3>
+      <p class="good"><b>Yes — proven on all three frameworks.</b> SGLang, vLLM and TRT-LLM all serve
+      DeepEP-V2 on EFA and pass AIPerf with coherent generation. The platform requirement: frameworks
+      must construct <code>ElasticBuffer</code>, not <code>Buffer</code> — asserted in the harness so a
+      silent fall-back to a broken transport cannot pass unnoticed.</p>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>The run-it-right knob: <code>EP_NUM_COMMS=8</code> (multi-comm)</h3>
+    <p>A single NCCL-GIN comm is issue-bound at ~8 GB/s SO — the CPU-proxy posts one
+    <code>fi_writedata</code>/doorbell per token, serialized on one progress thread. Minting K independent
+    comms behind the <code>ElasticBuffer</code> wall gives K progress threads and K× the issue ceiling.</p>
+    <div class="diag">multi-comm transport scaling (dispatch SO GB/s, prefill, MEASURED)
+
+  K=1   ████████                              ~8 GB/s   (single-comm, issue-bound)
+  K=2   █████████████                         12-13     1.7×
+  K=4   █████████████████████                 21
+  K=8   █████████████████████████████████     33        4.3×  ← peak, recommended
+
+  EP_NUM_COMMS=8 recovers vLLM serving 142 → 296 tok/s (2.09×) = PARITY with allgather.
+  It 4×'d transport BYTES but did NOT change serving tok/s. Run it right ≠ beat dense.</div>
+  </div>
+  <div class="twocol">
+    <div class="is"><b>Where DeepEP genuinely wins</b>
+      <ul>
+        <li><b>Transport bytes</b> <span class="pill m">measured</span> — 33–35 GB/s SO dispatch prefill,
+          <b>1.45× UCCL-published</b> (22.77). The O(top-k) volume reduction is real on the wire.</li>
+        <li><b>Capacity</b> — sharding experts fits a model that wouldn't otherwise (allgather-EP shares
+          this; it is an EP-itself win, not a DeepEP-a2a win).</li>
+        <li><b>Drop-in</b> — 3-framework serving proven; <code>EP_NUM_COMMS</code> mints the comms from a
+          stock import.</li>
+      </ul>
+    </div>
+    <div class="isnot"><b>Where it only ties / loses</b>
+      <ul>
+        <li><b>Serving tok/s</b> — TRT dense 1.5× faster; vLLM allgather a tie; prefill 1.25× to dense;
+          EP32 a dead tie.</li>
+        <li><b>Expert count anti-scales</b> <span class="pill m">measured</span> — 128 exp = 36 SO, 256 exp
+          = 13 SO (0.36×). More experts is <i>slower</i>.</li>
+        <li><b>Root cause</b> — the all-to-all is not the serving critical path, and the fixed
+          <b>+14.7 ms/token</b> CPU-proxy tax (~2.2% NIC util, issue-bound) never amortizes.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ============================ 3. UCCL ============================ -->
+  <h2>3 · UCCL — raw-ibverbs all-to-all, the fast-transport comparator</h2>
+  <div class="twocol">
+    <div class="panel">
+      <h3>What it is</h3>
+      <p>A raw-ibverbs MoE all-to-all wrapper. It bypasses the CPU proxy with GPU-driven raw verbs
+      (WR-chaining, per-thread CQ/QP, out-of-order drain) and lands ~<b>4× faster</b> on the dispatch
+      microbench — <b>47 µs</b> vs DeepEP's 186 µs. It is the closest thing on EFA to what GDAKI would
+      deliver, but implemented in user space.</p>
+    </div>
+    <div class="panel">
+      <h3>Does it serve on EFA?</h3>
+      <p class="warn"><b>Partial.</b> It <b>serves via stock SGLang</b>
+      (<code>--moe-a2a-backend deepep</code> + a <code>usercustomize</code> shadow so every rank picks up
+      the UCCL wrapper). It did <b>not serve stock vLLM</b> — vLLM's per-DP-worker
+      <code>Buffer</code> construction deadlocks UCCL's collective <code>all_gather_object</code>; SGLang's
+      symmetric launch satisfies the contract.</p>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>The headline finding — 4× transport, but a serving tie</h3>
+    <p>Same framework (SGLang), same pods/model, ≥2-rep, decode variance &lt;1%:</p>
+    <table>
+      <tr><th>regime</th><th>DeepEP-V2 tok/s</th><th>UCCL tok/s</th><th>DeepEP / UCCL</th></tr>
+      <tr><td>conc 32</td><td>263.9</td><td>254.2</td><td class="warn">1.038×</td></tr>
+      <tr><td>conc 256</td><td>2173.8</td><td>2105.4</td><td class="warn">1.032×</td></tr>
+    </table>
+
+    <!-- the gap visual: transport edge collapses to a serving tie -->
+    <svg viewBox="0 0 1000 196" role="img" aria-label="UCCL's roughly four-times transport-microbench advantage collapses to a one-times serving tie versus DeepEP">
+      <rect x="0" y="0" width="1000" height="196" fill="#0b0e15"/>
+      <text x="20" y="28" fill="#e8ecf4" font-family="sans-serif" font-size="13" font-weight="700">Transport microbench (dispatch latency, lower = faster)</text>
+      <!-- DeepEP transport bar -->
+      <text x="20" y="58" fill="#9aa4b8" font-family="sans-serif" font-size="12">DeepEP</text>
+      <rect x="120" y="46" width="760" height="16" rx="4" fill="#6ea8fe"/>
+      <text x="892" y="59" fill="#6ea8fe" font-family="sans-serif" font-size="12" font-weight="700">186 µs</text>
+      <!-- UCCL transport bar -->
+      <text x="20" y="84" fill="#9aa4b8" font-family="sans-serif" font-size="12">UCCL</text>
+      <rect x="120" y="72" width="192" height="16" rx="4" fill="#b07bff"/>
+      <text x="324" y="85" fill="#b07bff" font-family="sans-serif" font-size="12" font-weight="700">47 µs · ~4× faster</text>
+
+      <line x1="20" y1="108" x2="980" y2="108" stroke="#2a3040" stroke-dasharray="3 4"/>
+
+      <text x="20" y="134" fill="#e8ecf4" font-family="sans-serif" font-size="13" font-weight="700">Serving throughput (agg tok/s @ conc32, higher = faster)</text>
+      <!-- DeepEP serving bar -->
+      <text x="20" y="164" fill="#9aa4b8" font-family="sans-serif" font-size="12">DeepEP</text>
+      <rect x="120" y="152" width="760" height="16" rx="4" fill="#6ea8fe"/>
+      <text x="892" y="165" fill="#6ea8fe" font-family="sans-serif" font-size="12" font-weight="700">263.9</text>
+      <!-- UCCL serving bar -->
+      <text x="20" y="190" fill="#9aa4b8" font-family="sans-serif" font-size="12">UCCL</text>
+      <rect x="120" y="178" width="732" height="14" rx="4" fill="#b07bff"/>
+      <text x="864" y="190" fill="#b07bff" font-family="sans-serif" font-size="12" font-weight="700">254.2 · TIE (1.03×)</text>
+    </svg>
+    <p class="legend"><span class="pill m">measured</span> UCCL's ~4× transport edge <b>does not convert</b>
+    to serving throughput at EP16 — the bars on top are wildly unequal, the bars on the bottom are a tie.
+    This is the same conclusion the whole campaign reaches from the other direction: <b>all-to-all is not
+    the serving critical path</b>, so the fastest transport on EFA ties the proxy one when you actually serve.</p>
+  </div>
+  <p class="sub"><b>When to pick it.</b> As a research comparator, or where you can carry a fork and want the
+  robustness edge: DeepEP-V2's ElasticBuffer crashed on long-prompt prefill
+  (<code>num_max_tokens_per_rank=128</code> cap) where UCCL completed every cell. For turnkey serving on
+  EFA today, UCCL's fork requirement and serving tie make it a harder sell than dense or DeepEP-multicomm.</p>
+
+  <!-- ============================ 4. PPLX ============================ -->
+  <h2>4 · pplx (perplexity-garden) — built and benchmarked, no serve adapter</h2>
+  <div class="twocol">
+    <div class="panel">
+      <h3>What it is</h3>
+      <p>Perplexity's open MoE all-to-all kernels (perplexity-garden). We built them on EFA and ran the
+      transport benchmark to complete the comparison.</p>
+      <table>
+        <tr><th>path</th><th>EFA latency</th><th>vs published</th></tr>
+        <tr><td>dispatch</td><td>222 µs</td><td class="good">matches</td></tr>
+        <tr><td>combine</td><td>362 µs</td><td class="good">matches</td></tr>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Does it serve on EFA?</h3>
+      <p class="bad"><b>No — diagnostic comparator only.</b> pplx has <b>no serving adapter</b>: there is no
+      <code>vLLM</code> / <code>SGLang</code> backend that drives it for real inference. It validates the
+      transport layer (and confirms our EFA build is sane — the numbers match published), but it is not a
+      turnkey serving backend.</p>
+      <h3>When to pick it</h3>
+      <p>Transport benchmarking and sanity-checking a build. Not for production serving on EFA without
+      writing the missing serving integration yourself.</p>
+    </div>
+  </div>
+
+  <!-- ============================ 5. GDAKI ============================ -->
+  <h2>5 · IBGDA / GDAKI — GPU-initiated, the "what would improve it" answer</h2>
+  <div class="twocol">
+    <div class="panel">
+      <h3>What it is</h3>
+      <p>GPU-initiated communication: the kernel posts the work-queue entry and rings the doorbell itself —
+      <b>no CPU proxy on the data path</b>. This is the <i>only</i> path that would let DeepEP beat dense on
+      serving, because it removes the fixed +14.7 ms/token proxy tax that every measurement traces back to.</p>
+    </div>
+    <div class="isnot"><b>Does it serve on EFA? <span class="bad">No, not today.</span></b>
+      <ul>
+        <li>EFA SRD has <b>no atomics</b> and <b>no message ordering</b>; the kernel-posted-WQE dispatch
+          path needs both.</li>
+        <li>It depends on a <b>3-layer unshipped stack</b>: rdma-core comp-counter symbols, a libfabric
+          counter PR, and an aws-ofi-nccl hardware-counter hook — none publicly released.</li>
+        <li>It <b>works on InfiniBand</b> today (IBGDA/NVSHMEM). On EFA the cross-node <i>barrier</i> works
+          through our GDAKI override (~19 µs), but cross-node <i>dispatch</i> does not.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="warnbox">
+    <b>The honest frontier.</b> DeepEP's volume saving is real in bytes but never reaches the serving
+    critical path on EFA's CPU-proxy. Only GPU-initiated transport (GDAKI, or a UCCL-class raw-ibv port)
+    removes the per-step host round-trip that swamps it. GDAKI is upstream-gated; UCCL is a multi-week port
+    evaluated and declined as a dependency. Neither is reachable with a knob on EFA today — which is exactly
+    why, <i>on EFA</i>, the serving recommendation is dense or DeepEP-at-parity, not DeepEP-as-a-win.
+  </div>
+
+  <!-- ============================ VERDICT ============================ -->
+  <h2>Verdict — what to actually deploy</h2>
+  <div class="cards">
+    <div class="card">
+      <b class="good">▸ Serving on EFA, EP≤16</b>
+      <p class="mut">Use <b>dense allgather</b> (fastest on TRT-LLM, <span class="pill m">1.5×</span>) or
+      <b>DeepEP multi-comm</b> / <b>allgather</b> where they tie (vLLM, SGLang). Pick on robustness and
+      operational simplicity, since serving throughput is a wash.</p>
+    </div>
+    <div class="card">
+      <b class="warn">◆ Capacity-forced</b>
+      <p class="mut">If the model won't fit without sharding experts, use <b>DeepEP / EP</b> — a working
+      serve beats OOM. That is an EP-itself win (allgather-EP has it too), not a DeepEP-a2a throughput win.</p>
+    </div>
+    <div class="card">
+      <b class="mut">○ Research comparators</b>
+      <p class="mut"><b>UCCL</b> (fork, serving tie, long-prefill edge) and <b>pplx</b> (no serve adapter)
+      are for benchmarking the transport layer — not turnkey serving backends on EFA.</p>
+    </div>
+    <div class="card">
+      <b class="bad">▲ The future win</b>
+      <p class="mut">DeepEP beats dense on serving only with <b>GDAKI / IBGDA</b> — which removes the proxy
+      tax but is <b>InfiniBand-only today</b>. DeepEP's win on EFA is <b>capacity + a future GDAKI</b>.</p>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:18px;border-color:#2a3040">
+    <p style="margin:0;font-size:15px"><b>Bottom line.</b> On EFA today, for serving:
+    <b class="good">dense (TRT)</b> or <b class="warn">DeepEP-multicomm / allgather-tie (vLLM, SGLang)</b>.
+    <b class="mut">UCCL / pplx = research comparators.</b> DeepEP's real win is
+    <b>capacity</b> + a <b>future GDAKI</b> path the fabric cannot run yet.</p>
+  </div>
+
+  <div class="foot">
+    All <span class="pill m">measured</span> claims: efa-gda campaign, 2× p5en.48xlarge, 16 EFA NICs/node,
+    SRD (no atomics / no ordering / CQ-local / 1-SGE write), Qwen3-30B-A3B-FP8 EP16 unless noted. Sources:
+    EXP-AB-TRTLLM-DEEPEP-VS-DENSE, EXP-AB-DEEPEP-MULTICOMM-VS-DENSE, EXP-AIPERF-SGLANG-AB,
+    EXP-UCCL-SGLANG-LIVE, and the make-DeepEP-beneficial closeout (2026-06-19).
+    <br><br><b>Next: <a href="06-solution-arch.html">§6 Solution architecture →</a></b>
+  </div>
+
+</div>
+</body>
+</html>

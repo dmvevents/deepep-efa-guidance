@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>06 · Solution architecture + guidance — DeepEP on AWS EFA</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  /* section-local additions only — base lives in ../assets/site.css */
+  .lede{background:linear-gradient(180deg,#141826,#0f1117);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:14px 0 8px}
+  .lede p{margin:0;max-width:none;color:#cdd6e8}
+  .lede b{color:var(--ink)}
+  .stamp{display:inline-block;font:11px var(--mono);color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin:0 0 10px}
+  .aud{display:inline-block;font:10px var(--mono);text-transform:uppercase;letter-spacing:1px;padding:2px 8px;border-radius:5px;margin-right:8px;vertical-align:middle}
+  .aud.int{background:#2a1f3a;color:#c9a8ff;border:1px solid #443060}
+  .aud.cust{background:#10322a;color:var(--good);border:1px solid #1e5a45}
+  .kv{font-size:13px}
+  .kv td:nth-child(2),.kv th:nth-child(2){text-align:left;font:12px var(--mono)}
+  .kv td:first-child{font:12px var(--mono);color:#c9d4ea}
+  .stk-tbl td,.stk-tbl th{text-align:left}
+  .stk-tbl td:first-child{font:12px var(--mono);color:#c9d4ea;white-space:nowrap}
+  .tier{display:flex;align-items:center;gap:10px;margin:7px 0}
+  .tier .n{font:12px var(--mono);background:var(--panel2);border:1px solid var(--line);border-radius:6px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--mut)}
+  .verd{font:11px var(--mono);text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:5px}
+  .verd.go{background:#1b3a2c;color:var(--good)} .verd.tie{background:#3a3119;color:var(--warn)} .verd.no{background:#3a1d1d;color:var(--bad)}
+  .ctag{display:inline-block;font:18px var(--mono);width:30px;height:30px;line-height:30px;text-align:center;border-radius:7px;margin-bottom:6px}
+  .ctag.a{background:#10322a;color:var(--good)} .ctag.b{background:#23304a;color:var(--accent)} .ctag.c{background:#2a1f12;color:var(--warn)}
+  .card h3{margin:2px 0 6px;font-size:15px}
+  .flip{border-left:3px solid var(--ib);padding-left:12px;background:linear-gradient(90deg,rgba(176,123,255,.07),transparent);border-radius:0 8px 8px 0;padding:12px 12px 12px 14px}
+  .road{display:grid;grid-template-columns:120px 1fr;gap:0}
+  .road .when{font:11px var(--mono);color:var(--mut);padding:10px 12px 10px 0;border-right:2px solid var(--line);position:relative}
+  .road .when::after{content:"";position:absolute;right:-5px;top:14px;width:8px;height:8px;border-radius:50%;background:var(--line)}
+  .road .row.live .when::after{background:var(--good)}
+  .road .row.blk .when::after{background:var(--bad)}
+  .road .row.near .when::after{background:var(--warn)}
+  .road .what{padding:10px 0 10px 16px}
+  .road .what b{font-size:14px}
+  .micro{font:11px var(--mono);color:var(--mut)}
+  svg text{font-family:var(--mono);fill:#9fb3d8}
+  svg .nodefill{fill:#171a23;stroke:#2a3040}
+  svg .ink{fill:#e8ecf4}
+  svg .acc{fill:#6ea8fe} svg .gd{fill:#46c98b} svg .bd{fill:#ef6f6f} svg .wn{fill:#f0b357} svg .ib{fill:#b07bff} svg .mu{fill:#9aa4b8}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="brand">DeepEP&nbsp;on&nbsp;EFA</div>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">01 · What is DeepEP</a>
+    <a href="02-efa-vs-infiniband.html">02 · EFA vs IB</a>
+    <a href="03-scaling.html">03 · The stack</a>
+    <a href="04-microbenchmarks.html">04 · Measured results</a>
+    <a href="05-alternatives.html">05 · Frameworks</a>
+    <a href="06-solution-arch.html" style="color:var(--ink)">06 · Solution &amp; guidance</a>
+    <a href="../calculator/">Calculator ▸</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <span class="stamp">SECTION 06 / FINAL · solution architecture + deployment guidance</span>
+  <h1>Solution architecture &amp; guidance</h1>
+  <p class="sub">The decision layer. Everything the prior sections measured, distilled into <b>what to deploy</b>
+  and <b>when</b> — separated cleanly for two readers: the <span class="aud int">internal</span> architect choosing a
+  transport, and the <span class="aud cust">customer</span> who just needs a working MoE serve on AWS.</p>
+
+  <!-- ============================================================ §0 EXECUTIVE SUMMARY -->
+  <div class="lede">
+    <p><b>Executive summary.</b> On AWS EFA, DeepEP MoE all-to-all is a <b>working drop-in across three serving
+    frameworks</b> (SGLang, vLLM, TRT-LLM) — but it does <b>not beat</b> a dense / allgather alternative on serving
+    throughput. The reason is structural: EFA's CPU-proxy transport path is <b>issue-bound</b> (~<b>2.2% NIC
+    utilization</b> <span class="pill m">measured</span>) and pays a fixed <b>+14.7&nbsp;ms/token</b>
+    <span class="pill m">measured</span> per-decode-step tax that the all-to-all byte reduction cannot overcome.
+    Use DeepEP on EFA for <b>capacity</b> (fitting a too-big model) or <b>framework fit</b> — not for a serving
+    speedup. A serving speedup requires <b>GPU-initiated transport</b>, which EFA does not expose today.
+    <b>On InfiniBand the calculus flips</b>: IBGDA posts the WQE from the kernel, removes the proxy tax, and
+    DeepEP's transport win converts to a serving win.</p>
+  </div>
+  <p class="legend">Every measured claim below is tagged <span class="pill m">measured</span> on the efa-gda
+  campaign: 2× p5en.48xlarge, AWS EFA (16 NICs/node, 25&nbsp;GB/s/NIC effective), Qwen3-30B-A3B-FP8 EP16 unless
+  noted. <span class="pill d">derived</span> = computed from measured. <span class="pill a">assumed</span> = engineering
+  judgement, verify locally.</p>
+
+  <!-- ============================================================ §1 WHAT WORKS TODAY -->
+  <h2>1 · What works today on EFA — the proven stack</h2>
+  <p class="sub">One stack serves DeepEP-V2 MoE all-to-all on EFA today. It is a binary drop-in: the
+  <code>deep_ep</code> wheel and <code>ElasticBuffer</code> API are stock; the transport runs over the
+  open-source aws-ofi-nccl GIN plugin via a host CPU proxy. Three frameworks ride it, all serve coherently,
+  all pass AIPerf.</p>
+
+  <div class="twocol">
+    <div class="panel">
+      <h3>The data path <span class="pill m">measured</span></h3>
+      <div class="diag">  cross-node DeepEP-V2 dispatch on EFA (the working path)
+
+   ┌──────────────┐
+   │  GPU kernel  │  token routing, expert select (ElasticBuffer)
+   └──────┬───────┘
+          │ writes descriptors
+          ▼
+   ┌──────────────┐
+   │  D2H ring    │  device → host signal ring
+   └──────┬───────┘
+          │ wakes the host
+          ▼
+   ┌──────────────┐
+   │  CPU proxy   │  aws-ofi-nccl GIN, NCCL_GIN_TYPE=2   ◄── the +14.7 ms/token tax
+   └──────┬───────┘      single ep_lock · issue-bound · 2.2% NIC util
+          │ fi_writedata()
+          ▼
+   ┌──────────────┐
+   │  libfabric   │  efa-direct provider
+   └──────┬───────┘
+          │
+          ▼
+   ┌──────────────┐
+   │   EFA SRD    │  no atomics · no ordering · CQ-local · 1-SGE write
+   └──────┬───────┘
+          │  ~25 GB/s/NIC × 16
+          ▼
+   ┌──────────────┐
+   │  peer GPU    │  receiver polls (no recv CQE for unsolicited write)
+   └──────────────┘</div>
+    </div>
+
+    <div class="panel">
+      <h3>The pinned components <span class="pill m">measured</span></h3>
+      <table class="stk-tbl">
+        <tr><th>layer</th><th>what / why</th></tr>
+        <tr><td>DeepEP API</td><td><code>deep_ep.ElasticBuffer</code> — the EFA-viable buffer (NCCL-GIN). <b>Never</b> <code>deep_ep.Buffer</code>.</td></tr>
+        <tr><td>GIN transport</td><td><code>NCCL_GIN_TYPE=2</code> (CPU proxy). Type 3 = GDAKI = not shipping on EFA.</td></tr>
+        <tr><td>plugin</td><td>aws-ofi-nccl <code>9c44d34</code> — combine-rewrite + <code>FALLBACK_V1</code> gate-relax for <b>gdrdrv-2.4</b> nodes.</td></tr>
+        <tr><td>parallelism</td><td><code>EP_NUM_COMMS=8</code> — K independent NCCL comms = K proxy threads = 4.3× the issue-bound ceiling.</td></tr>
+        <tr><td>frameworks</td><td>SGLang 0.5.11 · vLLM (<code>deepep_v2</code>) · TRT-LLM 0.21 — all serve, all pass AIPerf.</td></tr>
+      </table>
+      <p class="legend">All three frameworks construct <code>ElasticBuffer</code> on EFA (SGLang/vLLM natively or
+      via shim; TRT-LLM via the api-shim path). Coherent generation verified end-to-end on each.</p>
+    </div>
+  </div>
+
+  <div class="warnbox">
+    <b>⚠ DENYLIST — hard-banned on EFA.</b> Do <b>not</b> construct <code>deep_ep.Buffer</code> (its cross-node
+    transport is NVSHMEM/IBGDA, which aborts on EFA — <code>nvshmemi_init_thread</code> IBGDA path).
+    Do <b>not</b> set <code>NVSHMEM_IB_ENABLE_IBGDA=1</code>. Use <code>ElasticBuffer</code> <i>exclusively</i> for
+    cross-node MoE on EFA, and <b>assert it in the harness</b> — a silent fall-through to <code>Buffer</code> looks
+    enabled but is wrong, and is the single most common deployment defect.
+  </div>
+
+  <!-- ============================================================ §2 DEPLOYMENT REQUIREMENTS -->
+  <h2>2 · Deployment requirements — the load-bearing config <span class="aud cust">customer-actionable</span></h2>
+  <p class="sub">These are not tuning knobs. Each one is a hard gate — get it wrong and DeepEP either fails to
+  initialize or silently runs the wrong (forbidden) transport. Set all of them.</p>
+
+  <div class="twocol">
+    <div class="panel is">
+      <h3>Pod must be privileged + mount host <code>/dev</code></h3>
+      <p>The GIN proxy opens <code>/dev/gdrdrv</code> for GPUDirect. Without a privileged pod and a hostPath
+      <code>/dev</code> mount, <code>gdr_open()</code> returns <b>EPERM</b> → GIN logs <i>"Failed to open gdr
+      handle"</i> → <code>ginType==NONE</code> → <code>ElasticBuffer</code> asserts at construction.
+      <span class="pill m">measured</span></p>
+      <p class="micro">This is a <b>manifest</b> bug, not a plugin/gdrcopy-version bug — the most expensive one to
+      misdiagnose. It is the load-bearing requirement.</p>
+    </div>
+    <div class="panel is">
+      <h3>EP16 mandatory for cross-node MoE</h3>
+      <p>Expert-parallel all-to-all only engages when <code>ep_size &gt; top_k</code>. For a top-8 MoE that means
+      <b>EP ≥ 16</b> (2 nodes × 8 GPUs). Below that, experts collapse onto fewer ranks and you are not exercising
+      the cross-node path at all. <span class="pill m">measured</span></p>
+      <p class="micro">EP16 = the minimum honest 2-node configuration. Intra-node EP rides NVLink and pays no EFA tax.</p>
+    </div>
+  </div>
+
+  <h3>Environment — the complete set</h3>
+  <table class="kv">
+    <tr><th>variable</th><th>value</th><th>why</th></tr>
+    <tr><td>NCCL_GIN_TYPE</td><td>2</td><td>CPU-proxy GIN. The only EFA-viable transport (3=GDAKI is upstream-gated).</td></tr>
+    <tr><td>EP_NUM_COMMS</td><td>8</td><td>Multi-comm. K proxy threads → 4.3× the single-comm 8&nbsp;GB/s ceiling. <span class="pill m">measured</span></td></tr>
+    <tr><td>NCCL_NET_PLUGIN</td><td><span class="mut">→ aws-ofi-nccl 9c44d34</span></td><td>combine-rewrite + V1 gdr-pin fallback for gdrdrv-2.4 nodes.</td></tr>
+    <tr><td>SGLANG_DEEPEP_USE_V2</td><td>1</td><td>SGLang: select DeepEP-V2 ElasticBuffer (not legacy Buffer).</td></tr>
+    <tr><td>SGLANG_DEEPEP_NUM_MAX_DISPATCH<wbr>_TOKENS_PER_RANK</td><td>512</td><td>Lifts the 128-tok/rank cap that crashes long-prompt prefill at conc≥32.</td></tr>
+    <tr><td class="mut">pod spec</td><td><span class="warn">privileged: true</span></td><td>+ hostPath mount of <code>/dev</code> — see above. Non-negotiable.</td></tr>
+  </table>
+  <p class="legend">Framework selection of the backend differs (<code>--moe-a2a-backend deepep</code> on SGLang,
+  <code>--all2all-backend deepep_v2</code> on vLLM, AlltoallMethodType.DeepEP via shim on TRT-LLM) — but the
+  transport stack below the framework is identical across all three.</p>
+
+  <!-- ============================================================ §3 INTERNAL DECISION TREE -->
+  <h2>3 · Internal solution-architecture decision tree <span class="aud int">internal</span></h2>
+  <p class="sub">For the architect placing a MoE model on AWS. Follow the branch; the leaf is the transport choice.
+  The pivot is always the same question — <i>is the network InfiniBand or EFA, and is your goal throughput or
+  capacity?</i></p>
+
+  <svg viewBox="0 0 1040 560" role="img" aria-label="Decision tree: choosing a MoE transport on AWS">
+    <!-- root -->
+    <rect class="nodefill" x="420" y="14" width="200" height="44" rx="8"/>
+    <text x="520" y="34" text-anchor="middle" class="ink" font-size="13">MoE model on AWS?</text>
+    <text x="520" y="50" text-anchor="middle" class="mu" font-size="11">choose the transport</text>
+
+    <!-- level 1: fits one node? -->
+    <line x1="520" y1="58" x2="520" y2="86" stroke="#2a3040"/>
+    <rect class="nodefill" x="400" y="86" width="240" height="44" rx="8"/>
+    <text x="520" y="106" text-anchor="middle" class="ink" font-size="13">Fits in one node?</text>
+    <text x="520" y="122" text-anchor="middle" class="mu" font-size="11">(model + KV-cache vs 8× GPU mem)</text>
+
+    <!-- YES one node -> NVLink -->
+    <line x1="400" y1="108" x2="190" y2="108" stroke="#2a3040"/>
+    <line x1="190" y1="108" x2="190" y2="150" stroke="#2a3040"/>
+    <text x="300" y="102" text-anchor="middle" class="gd" font-size="11">yes · 1 node</text>
+    <rect class="nodefill" x="60" y="150" width="260" height="58" rx="8" stroke="#1e5a45"/>
+    <text x="190" y="174" text-anchor="middle" class="gd" font-size="13">Use NVLink EP</text>
+    <text x="190" y="192" text-anchor="middle" class="mu" font-size="11">all-to-all on NVLink · no EFA tax.</text>
+    <text x="190" y="204" text-anchor="middle" class="mu" font-size="11">DeepEP optional, no benefit vs dense.</text>
+
+    <!-- NO one node -> multi-node -->
+    <line x1="640" y1="108" x2="520" y2="108" stroke="#2a3040"/>
+    <line x1="520" y1="130" x2="520" y2="160" stroke="#2a3040"/>
+    <text x="600" y="148" text-anchor="middle" class="wn" font-size="11">no · multi-node</text>
+
+    <!-- level 2: which fabric -->
+    <rect class="nodefill" x="400" y="160" width="240" height="44" rx="8"/>
+    <text x="520" y="180" text-anchor="middle" class="ink" font-size="13">Which fabric?</text>
+    <text x="520" y="196" text-anchor="middle" class="mu" font-size="11">cross-node interconnect</text>
+
+    <!-- IB branch -->
+    <line x1="400" y1="182" x2="200" y2="182" stroke="#443060"/>
+    <line x1="200" y1="182" x2="200" y2="250" stroke="#443060"/>
+    <text x="300" y="176" text-anchor="middle" class="ib" font-size="11">InfiniBand</text>
+    <rect class="nodefill" x="60" y="250" width="280" height="66" rx="8" stroke="#443060"/>
+    <text x="200" y="276" text-anchor="middle" class="ib" font-size="13">DeepEP + IBGDA WINS</text>
+    <text x="200" y="295" text-anchor="middle" class="mu" font-size="11">kernel-posted WQE removes the proxy tax;</text>
+    <text x="200" y="307" text-anchor="middle" class="mu" font-size="11">transport win → serving win. Use DeepEP.</text>
+
+    <!-- EFA branch -->
+    <line x1="640" y1="182" x2="840" y2="182" stroke="#5a3a1c"/>
+    <line x1="840" y1="182" x2="840" y2="220" stroke="#5a3a1c"/>
+    <text x="740" y="176" text-anchor="middle" class="efa" font-size="11" style="fill:#ff8a5c">EFA</text>
+
+    <!-- EFA level 3: throughput or capacity -->
+    <rect class="nodefill" x="700" y="220" width="280" height="48" rx="8" stroke="#5a3a1c"/>
+    <text x="840" y="242" text-anchor="middle" class="ink" font-size="13">Throughput or capacity?</text>
+    <text x="840" y="258" text-anchor="middle" class="mu" font-size="11">what is the binding goal</text>
+
+    <!-- throughput leaf -->
+    <line x1="700" y1="244" x2="560" y2="244" stroke="#2a3040"/>
+    <line x1="560" y1="244" x2="560" y2="360" stroke="#2a3040"/>
+    <text x="600" y="300" text-anchor="middle" class="wn" font-size="11">throughput</text>
+    <rect class="nodefill" x="400" y="360" width="320" height="80" rx="8" stroke="#5a3a1c"/>
+    <text x="560" y="384" text-anchor="middle" class="wn" font-size="13">Measure your alternative first</text>
+    <text x="560" y="404" text-anchor="middle" class="mu" font-size="11">TRT dense: <tspan class="ink">1.5× faster</tspan> → use dense.</text>
+    <text x="560" y="418" text-anchor="middle" class="mu" font-size="11">vLLM allgather: <tspan class="ink">TIE</tspan> → DeepEP-multicomm OK.</text>
+    <text x="560" y="432" text-anchor="middle" class="mu" font-size="11">DeepEP does not win throughput on EFA.</text>
+
+    <!-- capacity leaf -->
+    <line x1="980" y1="244" x2="980" y2="360" stroke="#2a3040"/>
+    <text x="935" y="300" text-anchor="middle" class="gd" font-size="11">capacity-forced</text>
+    <rect class="nodefill" x="760" y="360" width="280" height="80" rx="8" stroke="#1e5a45"/>
+    <text x="900" y="384" text-anchor="middle" class="gd" font-size="13">Use DeepEP / EP to fit</text>
+    <text x="900" y="404" text-anchor="middle" class="mu" font-size="11">model too big for one node →</text>
+    <text x="900" y="418" text-anchor="middle" class="mu" font-size="11">shard experts. Accept the a2a toll;</text>
+    <text x="900" y="432" text-anchor="middle" class="mu" font-size="11">a working serve beats OOM.</text>
+
+    <!-- footnote line -->
+    <text x="520" y="500" text-anchor="middle" class="mu" font-size="11">EFA throughput leaf: the alternative is a same-framework dense / allgather backend — pick the transport on measured tok/s, not vendor bytes.</text>
+    <text x="520" y="520" text-anchor="middle" class="acc" font-size="11">DeepEP's all-to-all is not the serving critical path on EFA. The fabric, not the kernel, decides the verdict.</text>
+  </svg>
+  <p class="legend">Leaf colors: <span class="good">green</span> = clear use, <span class="warn">amber</span> = measure /
+  tie, <span class="ib" style="color:#b07bff">purple</span> = InfiniBand-only win. The EFA throughput branch is the
+  one most likely to surprise — see the customer cards below for the per-framework call.</p>
+
+  <!-- ============================================================ §4 CUSTOMER CARDS -->
+  <h2>4 · Customer-facing guidance <span class="aud cust">customer</span></h2>
+  <p class="sub">Three intents, three answers. Pick the card that matches what you are actually trying to do.</p>
+
+  <div class="cards">
+    <div class="card">
+      <span class="ctag a">✓</span>
+      <h3>"Just want it to work"</h3>
+      <p class="mut">DeepEP-V2 is a proven drop-in on EFA across <b>all three</b> frameworks. Deploy the stack from
+      §2 verbatim: <code>ElasticBuffer</code> + <code>NCCL_GIN_TYPE=2</code> + plugin 9c44d34 +
+      <code>EP_NUM_COMMS=8</code>, privileged pod with <code>/dev</code> mounted.</p>
+      <p class="micro good">All three serve coherently · all pass AIPerf · EP16 on 2× p5en. <span class="pill m">measured</span></p>
+    </div>
+
+    <div class="card">
+      <span class="ctag b">▲</span>
+      <h3>"Max throughput on EFA"</h3>
+      <p class="mut">Measure your alternative. On <b>TRT-LLM</b> the dense path is <b>~1.5× faster</b> — use dense.
+      On <b>vLLM</b> it is a <b>tie</b> (allgather ≈ DeepEP-multicomm) — pick on ops. DeepEP does not give you a
+      throughput edge here; choose on operations, not on the all-to-all.</p>
+      <p class="micro warn">TRT 0.67× · vLLM 0.97× · SGLang vs UCCL 1.03× (tie). <span class="pill m">measured</span></p>
+    </div>
+
+    <div class="card">
+      <span class="ctag c">◆</span>
+      <h3>"Model too big for one node"</h3>
+      <p class="mut">Use EP / DeepEP for <b>capacity</b> — sharding experts is how a 235B / 256-expert MoE fits at
+      all and frees KV-cache memory. Accept the all-to-all toll: the alternative is OOM, not a faster serve. This
+      is an <b>EP-itself</b> win (allgather-EP has it too).</p>
+      <p class="micro mut">Capacity is the genuine, often-mandatory advantage — distinct from the contested
+      throughput claim. <span class="pill a">verify against your GPU memory</span></p>
+    </div>
+  </div>
+
+  <div class="flip">
+    <b>The InfiniBand flip.</b> Every "tie" or "use dense" verdict above is an <i>EFA</i> verdict. On an InfiniBand
+    cluster, IBGDA posts the dispatch WQE directly from the GPU kernel, the +14.7&nbsp;ms/token proxy round-trip
+    disappears, and DeepEP's O(top-k) transport reduction converts into a real serving speedup. Same model, same
+    framework — different fabric, opposite recommendation. <span class="pill a">assumed by architecture; EFA path
+    is the measured one here</span>
+  </div>
+
+  <!-- ============================================================ §5 ROADMAP -->
+  <h2>5 · Roadmap — what would make DeepEP win on EFA</h2>
+  <p class="sub">The single lever that flips the verdict is <b>GPU-initiated transport</b>: post the dispatch WQE
+  from the CUDA kernel itself (GDAKI), removing the host proxy round-trip. That converts DeepEP's measured
+  transport win into a serving win. Here is exactly where that stands — honestly.</p>
+
+  <div class="panel">
+    <div class="road">
+      <div class="row live">
+        <div class="when">SHIPPING<br>today</div>
+        <div class="what"><b>CPU-proxy ElasticBuffer</b> <span class="verd go">works</span>
+          <p class="mut">3-framework drop-in, EP16, multi-comm. Parity with dense/allgather; <b>1.45×</b> dense on
+          transport <i>bytes</i> but that never reaches tok/s. <span class="pill m">measured</span></p></div>
+      </div>
+      <div class="row live">
+        <div class="when">GDAKI<br>barrier</div>
+        <div class="what"><b>Kernel-posted WQE — barrier path</b> <span class="verd go">works</span>
+          <p class="mut">Cross-node DeepEP barrier runs GPU-initiated over EFA at <b>~19&nbsp;µs</b>. Proof the wire
+          accepts kernel-posted traffic. <span class="pill m">measured</span></p></div>
+      </div>
+      <div class="row blk">
+        <div class="when">GDAKI<br>dispatch</div>
+        <div class="what"><b>Kernel-posted WQE — dispatch path</b> <span class="verd no">blocked</span>
+          <p class="mut">Blocked on an unshipped 3-layer stack: rdma-core hardware-counter symbols, libfabric
+          efa-direct counter support (PR open), and the aws-ofi-nccl plugin export. EFA SRD also has no atomics /
+          ordering, which the DOCA put-signal path assumes.</p></div>
+      </div>
+      <div class="row near">
+        <div class="when">software<br>near-term</div>
+        <div class="what"><b>In-plugin K-thread rail driving</b> <span class="verd tie">scoped · GO</span>
+          <p class="mut">Shard the proxy <code>iput</code> post path across K dedicated post threads with per-shard
+          request pools and a split <code>ep_lock</code> — attacks the issue-bound ceiling in software, no kernel
+          change. Multi-day C++ build; the <code>EP_NUM_COMMS=K</code> user-space path already ships the throughput
+          win so no serving deliverable is blocked. <span class="pill a">scoped, not yet built</span></p></div>
+      </div>
+    </div>
+  </div>
+  <p class="legend"><b>Honest status:</b> GPU-initiated dispatch on EFA is <b>not shipping today</b>. The nearer-term
+  software path (K-thread rail driving) is the realistic next lever. Until one of these lands, DeepEP-on-EFA is a
+  capacity / framework-fit tool, not a serving accelerator — exactly what §0 says.</p>
+
+  <!-- ============================================================ CLOSE -->
+  <div class="twocol" style="margin-top:26px">
+    <div class="panel is">
+      <b>When DeepEP on EFA is the right call</b>
+      <ul>
+        <li>The model does not fit in one node (capacity-forced) — EP is mandatory.</li>
+        <li>Your framework's a2a backend <i>is</i> DeepEP and the alternative is heavier (vLLM allgather → tie).</li>
+        <li>You need the proven 3-framework drop-in and ops simplicity over a marginal throughput delta.</li>
+        <li>You are on InfiniBand, not EFA — then it wins outright.</li>
+      </ul>
+    </div>
+    <div class="panel isnot">
+      <b>When to pick the alternative</b>
+      <ul>
+        <li>Throughput is the goal and the dense path is fast (TRT-LLM → dense ~1.5× faster).</li>
+        <li>You expected the all-to-all byte reduction to speed up decode — it doesn't on EFA's issue-bound proxy.</li>
+        <li>Expert count is very high (256) — the per-op tax anti-scales (0.36× vs 128 experts). <span class="pill m">measured</span></li>
+        <li>You constructed <code>deep_ep.Buffer</code> — that path is NVSHMEM/IBGDA and forbidden on EFA.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot">
+    <p>End of the DeepEP-on-EFA guidance site. ← Back to the <a href="../index.html">Overview</a> ·
+    run the numbers for your own model + workload in the
+    <a href="../calculator/">DeepEP-on-EFA Calculator ▸</a></p>
+    <p class="micro">All measured claims sourced from the efa-gda campaign A/B experiments (TRT-LLM-vs-dense,
+    DeepEP-multicomm-vs-dense, SGLang DeepEP-vs-UCCL, AIPerf 0.10.0). Sanitized — no IPs, account IDs, or hostnames.</p>
+  </div>
+
+</div>
+</body>
+</html>

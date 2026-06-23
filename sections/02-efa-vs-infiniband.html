@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§2 · EFA vs InfiniBand — why MoE all-to-all behaves differently | DeepEP-on-EFA</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  /* section-local: only what site.css doesn't already provide */
+  .lead{font-size:16px;color:var(--mut);max-width:880px;margin:6px 0 4px}
+  .key-ib{color:var(--ib);font-weight:700}.key-efa{color:var(--efa);font-weight:700}
+  .swatch{display:inline-block;width:11px;height:11px;border-radius:3px;vertical-align:-1px;margin-right:5px}
+  table.fab td:not(:first-child),table.fab th:not(:first-child){text-align:left}
+  .mathblock{font:13px/1.7 var(--mono);background:#0b0e15;border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:8px;padding:14px 16px;color:#bcd0f0;margin:12px 0;overflow-x:auto}
+  .mathblock .res{color:var(--good)}.mathblock .lbl{color:var(--mut)}.mathblock .op{color:var(--efa)}
+  .tag-ib{display:inline-block;font:10px var(--mono);background:#2a1f3d;color:var(--ib);padding:1px 6px;border-radius:5px;text-transform:uppercase;letter-spacing:.5px}
+  .tag-efa{display:inline-block;font:10px var(--mono);background:#3a2418;color:var(--efa);padding:1px 6px;border-radius:5px;text-transform:uppercase;letter-spacing:.5px}
+  .figcap{font-size:12px;color:var(--mut);margin:2px 0 18px;max-width:920px}
+  .figcap b{color:var(--ink)}
+  .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .kpi .card{text-align:center}
+  .kpi .big{font:28px/1 var(--mono);font-weight:700;margin:2px 0 4px}
+  .kpi .lbl{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.6px}
+  .next{display:inline-block;margin-top:18px;padding:10px 16px;background:var(--panel2);border:1px solid var(--line);
+    border-radius:8px;text-decoration:none;color:var(--accent);font-weight:700}
+  .next:hover{border-color:var(--accent)}
+  hr.rule{border:0;border-top:1px solid var(--line);margin:30px 0}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="brand">DeepEP&nbsp;on&nbsp;EFA</div>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">1 · MoE</a>
+    <a href="02-efa-vs-infiniband.html" style="color:var(--ink)">2 · EFA vs IB</a>
+    <a href="03-scaling.html">3 · Scaling</a>
+    <a href="04-microbenchmarks.html">4 · Frameworks</a>
+    <a href="05-alternatives.html">5 · Tuning</a>
+    <a href="06-solution-arch.html">6 · Decision</a>
+    <a href="../calculator/">Calculator ▸</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <h1>§2 · EFA vs InfiniBand — why MoE all-to-all behaves differently</h1>
+  <p class="lead">Mixture-of-Experts dispatch is a storm of <b>small, latency-sensitive messages</b>, not a
+  bandwidth-bound bulk transfer. That single fact is why the same DeepEP code that flies on an InfiniBand /
+  IBGDA cluster runs into a wall on AWS EFA. This section derives the wall from the wire up: the transport
+  semantics, the per-operation latency math, the measured <span class="key-efa">2.2% NIC utilization</span>,
+  and the load-invariant <span class="key-efa">+14.7&nbsp;ms/token</span> decode tax that is the headline result.</p>
+  <p class="lead">Throughout, color is consistent so you can read the diagrams at a glance:
+  <span class="swatch" style="background:#b07bff"></span><span class="key-ib">InfiniBand&nbsp;RC</span> (ordered,
+  atomic, GPU-initiated) versus
+  <span class="swatch" style="background:#ff8a5c"></span><span class="key-efa">AWS&nbsp;EFA&nbsp;SRD</span>
+  (scalable reliable datagram — no ordering, no atomics, host-proxied).</p>
+
+  <!-- ============================================================ 1. TWO FABRICS ============================================================ -->
+  <h2>1 · The two fabrics, side by side</h2>
+  <p class="sub">InfiniBand serving GPUDirect uses <b>Reliable Connected (RC)</b> queue pairs: a connection-oriented,
+  in-order, fully-featured RDMA transport. AWS EFA uses <b>Scalable Reliable Datagram (SRD)</b>: reliable delivery
+  and multipath spraying for scale, but a deliberately <i>thinner</i> verb set. The differences below are not
+  tuning knobs — they are properties of the wire, and each one removes a primitive DeepEP's fast path was built on.</p>
+
+  <table class="fab">
+    <tr>
+      <th>Property</th>
+      <th><span class="tag-ib">InfiniBand · RC</span></th>
+      <th><span class="tag-efa">AWS EFA · SRD</span></th>
+      <th>Why it matters for MoE dispatch</th>
+    </tr>
+    <tr>
+      <td>Message ordering</td>
+      <td class="good">Ordered — RC delivers in send order</td>
+      <td class="bad"><code>msg_order = [ ]</code> — no ordering guarantee</td>
+      <td>DeepEP's receiver advances a per-peer signal sequence <i>in order</i>; SRD multipath can reorder, so the
+        plugin must serialize completions instead of pipelining them.</td>
+    </tr>
+    <tr>
+      <td>Hardware atomics</td>
+      <td class="good">FI_ATOMIC — fetch-add, CAS in NIC</td>
+      <td class="bad">NO FI_ATOMIC — atomics absent from caps</td>
+      <td>The GPU-initiated signal path (DOCA <code>put_signal</code>) issues an RDMA atomic fetch-add to bump a
+        peer's arrival counter. On EFA that WQE is silently dropped — the signal never lands.</td>
+    </tr>
+    <tr>
+      <td>Write-with-immediate</td>
+      <td class="good">WriteImm — data + 32-bit imm, one op</td>
+      <td class="bad">No WriteImm on the SRD RMA write</td>
+      <td>One-op "deliver payload + notify" is impossible; payload and notification become separate operations,
+        roughly doubling the per-token op count.</td>
+    </tr>
+    <tr>
+      <td>Completion semantics</td>
+      <td>CQE ⇒ <b>remotely</b> visible (RC)</td>
+      <td class="warn">CQ is <b>LOCAL</b> — CQE = NIC accepted the WQE, <i>not</i> delivered</td>
+      <td>A sender-side completion proves nothing about the peer. Wire-level verification must read peer memory
+        or HW counters — "N posts fired" is Layer-0 evidence only.</td>
+    </tr>
+    <tr>
+      <td>GPU-initiated comm</td>
+      <td class="good">IBGDA — kernel posts WQE to NIC directly</td>
+      <td class="bad">GDAKI — present but <b>not shipped</b> end-to-end (3-layer stack gap)</td>
+      <td>Without a kernel-posted WQE path, every cross-node op detours through the host CPU proxy — the central
+        cost this whole section quantifies.</td>
+    </tr>
+    <tr>
+      <td>Memory registration</td>
+      <td>rkey usable across the HCA</td>
+      <td class="warn">MR is <b>per-NIC</b> — an rkey from NIC&nbsp;0 is invalid on NIC&nbsp;1</td>
+      <td>16 NICs/node means 16 separate registrations and rkey tables; the plugin allgathers per-peer, per-NIC
+        keys rather than one global key.</td>
+    </tr>
+    <tr>
+      <td>Scatter-gather on RDMA write</td>
+      <td>Multi-SGE gather supported</td>
+      <td class="bad">RDMA write is <b>1 local SGE</b> (send-only inline differs)</td>
+      <td>You cannot gather "payload + co-located count" in one WQE — the trick that would halve dispatch ops is
+        rejected at the descriptor level (<code>EFA_IO_TX_DESC_NUM_RDMA_BUFS = 1</code>).</td>
+    </tr>
+    <tr>
+      <td>Multipath</td>
+      <td>Single path per QP</td>
+      <td class="good">Spray across paths — scales to many flows</td>
+      <td>EFA's strength: it scales to thousands of flows without HoL blocking. The cost is the reordering above —
+        a trade made <i>for</i> scale-out, not bandwidth per flow.</td>
+    </tr>
+  </table>
+
+  <div class="panel" style="border-left:3px solid var(--efa)">
+    <b>The hardware ceiling is not the problem.</b> A p5en.48xlarge node has
+    <span class="key-efa">16 EFA NICs × 25 GB/s effective</span> = <b>400 GB/s/node</b> of bisection
+    <span class="pill m">measured</span> (25 GB/s/NIC effective per PR&nbsp;#612). InfiniBand and EFA are in the
+    same bandwidth class here. The gap this section explains is entirely about <i>how fast you can issue small
+    operations</i>, not how many bytes the wire can carry.
+  </div>
+
+  <!-- ============================================================ 2. LATENCY MATH ============================================================ -->
+  <h2>2 · The latency math — a host round-trip per all-to-all op</h2>
+  <p class="sub">MoE dispatch sends each token's hidden vector to its top-k experts, which are scattered across the
+  EP group. At decode the message is tiny — one token's worth, a few KB — and there are many of them. So the cost
+  that matters is <b>per-operation issue latency × operation count</b>, not aggregate bandwidth. Here the two
+  fabrics diverge sharply.</p>
+
+  <div class="twocol">
+    <div class="is"><b><span class="tag-ib">InfiniBand · IBGDA</span> — kernel-issued</b>
+      <p class="mut" style="margin:8px 0">The GPU kernel builds the work-queue entry in device memory and rings the
+      NIC doorbell <i>itself</i>. The host CPU is never on the data path.</p>
+      <div class="mathblock"><span class="lbl"># per-op cost, IBGDA (kernel-posted WQE)</span>
+t_op <span class="op">=</span> t_doorbell <span class="op">+</span> t_RTT
+     <span class="op">≈</span>  ~0.3 µs  <span class="op">+</span>  ~1–2 µs   <span class="lbl">(SRD-class RTT)</span>
+     <span class="op">≈</span> <span class="res">~1.5–2 µs, fully pipelined</span></div>
+    </div>
+    <div class="isnot"><b><span class="tag-efa">AWS EFA · today</span> — host-proxied</b>
+      <p class="mut" style="margin:8px 0">No kernel-posted WQE path is shipped. The kernel hands off to a CPU
+      proxy, which calls libfabric, which posts to the NIC. Every op is a GPU→host→NIC round-trip.</p>
+      <div class="mathblock"><span class="lbl"># per-op cost, CPU-proxy GIN (measured-derived)</span>
+t_op <span class="op">=</span> t_D2Hring <span class="op">+</span> t_proxypoll <span class="op">+</span> t_libfabric <span class="op">+</span> t_RTT
+     <span class="lbl"># GPU writes a D2H ring slot, a CPU proxy thread</span>
+     <span class="lbl"># polls it, builds + posts the fi_writedata, then SRD</span>
+     <span class="op">⇒</span> <span class="res">a host round-trip, serialized per op</span></div>
+    </div>
+  </div>
+
+  <p class="sub" style="margin-top:16px">Two structural facts make the EFA path worse than the raw round-trip
+  suggests, and both come straight from §1:</p>
+  <ul>
+    <li>The proxy is <b>single-threaded per device</b> — one mutex-serialized progress loop drives the NIC, so ops
+      do not overlap the way kernel-issued WQEs do <span class="pill m">measured</span>.</li>
+    <li>No WriteImm + no atomics means <b>~2 operations per token</b> (a data write and a separate signal/count
+      op) where IBGDA needs one — so the op count being multiplied by <code>t_op</code> is itself larger
+      <span class="pill d">derived</span>.</li>
+  </ul>
+
+  <p class="sub">Decode is the worst case: a single token per user per step, dispatched to top-k experts, every
+  forward pass. Bandwidth is irrelevant — you are paying <code>t_op</code> many times in series, and on EFA each
+  <code>t_op</code> carries a host round-trip that InfiniBand's IBGDA does not.</p>
+
+  <!-- ============================================================ 3. 2.2% NIC UTILIZATION ============================================================ -->
+  <h2>3 · The key measured number — 2.2% NIC utilization (issue-bound, not wire-bound)</h2>
+  <p class="sub">If the wire were the bottleneck, the EFA NICs would be saturated during dispatch. They are not.
+  On the DeepEP dispatch path the measured NIC utilization is <span class="key-efa">~2.2%</span> — the fabric is
+  <b>97.8% idle</b>. The limit is the rate at which the host proxy can <i>issue</i> operations, not the rate at
+  which the wire can carry <i>bytes</i>.</p>
+
+  <svg viewBox="0 0 920 150" role="img" aria-label="EFA NIC utilization on the DeepEP dispatch path: 2.2 percent used, 97.8 percent idle">
+    <text x="20" y="28" fill="#e8ecf4" font-family="SFMono-Regular,Consolas,monospace" font-size="13" font-weight="700">EFA NIC utilization — DeepEP dispatch path</text>
+    <!-- track -->
+    <rect x="20" y="48" width="880" height="46" rx="6" fill="#11141d" stroke="#2a3040"/>
+    <!-- used: 2.2% of 880 = 19.4px -->
+    <rect x="20" y="48" width="19.4" height="46" rx="6" fill="#ff8a5c"/>
+    <!-- idle label area -->
+    <text x="470" y="76" fill="#9aa4b8" font-family="SFMono-Regular,Consolas,monospace" font-size="13" text-anchor="middle">97.8% idle — wire is waiting on the host proxy</text>
+    <!-- callout to the sliver -->
+    <line x1="39" y1="48" x2="60" y2="118" stroke="#ff8a5c" stroke-width="1.5"/>
+    <text x="64" y="122" fill="#ff8a5c" font-family="SFMono-Regular,Consolas,monospace" font-size="13" font-weight="700">2.2% used</text>
+    <text x="155" y="122" fill="#9aa4b8" font-family="SFMono-Regular,Consolas,monospace" font-size="12">← the entire dispatch traffic fits here</text>
+    <!-- scale ticks -->
+    <text x="900" y="112" fill="#9aa4b8" font-family="SFMono-Regular,Consolas,monospace" font-size="11" text-anchor="end">400 GB/s/node available</text>
+  </svg>
+  <p class="figcap"><b>Issue-bound, not wire-bound.</b> DeepEP's whole value proposition is reducing all-to-all
+  <i>bytes</i> (it sends each token to only its top-k experts, an <code>O(top-k)</code> volume instead of
+  all-experts). But when the wire is 97.8% idle, sending fewer bytes does not make dispatch faster — you are
+  gated on per-op post rate through the host, and that rate is unchanged whether the payload is large or small.
+  <span class="pill m">measured</span> This is the crux: <b>byte-reduction is the wrong lever for an issue-bound
+  path.</b></p>
+
+  <!-- ============================================================ 4. DECODE TAX ============================================================ -->
+  <h2>4 · The decode-step tax — a fixed +14.7 ms/token, load-invariant</h2>
+  <p class="sub">This is the headline result, and the proof is in the <i>shape</i> of the data. Across a wide sweep
+  of concurrency (4 → 32) and input length (ISL 120 → 2048), the DeepEP per-user decode throughput does not
+  move: it sits at <span class="key-efa">19.6 tok/s (σ = 0.13)</span>. The same-framework dense / allgather arm is
+  also flat, at <span class="good">27.6 tok/s</span>. Two flat lines, separated by a constant gap.</p>
+
+  <div class="kpi">
+    <div class="card"><div class="lbl">DeepEP per-user</div><div class="big" style="color:var(--efa)">19.6</div><div class="mut" style="font-size:11px">tok/s · σ=0.13 <span class="pill m">measured</span></div></div>
+    <div class="card"><div class="lbl">Dense per-user</div><div class="big" style="color:var(--good)">27.6</div><div class="mut" style="font-size:11px">tok/s · σ=0.51 <span class="pill m">measured</span></div></div>
+    <div class="card"><div class="lbl">Fixed tax</div><div class="big" style="color:var(--bad)">+14.7</div><div class="mut" style="font-size:11px">ms/token <span class="pill d">derived</span></div></div>
+    <div class="card"><div class="lbl">Ratio</div><div class="big" style="color:var(--warn)">~0.67×</div><div class="mut" style="font-size:11px">0.65 / 0.69 / 0.67 <span class="pill m">measured</span></div></div>
+  </div>
+
+  <svg viewBox="0 0 920 380" role="img" aria-label="Per-user decode throughput is flat across load for both DeepEP and dense; the constant gap is the fixed proxy tax">
+    <!-- plot frame -->
+    <text x="20" y="26" fill="#e8ecf4" font-family="SFMono-Regular,Consolas,monospace" font-size="13" font-weight="700">Per-user decode throughput vs load — both lines flat ⇒ the gap is a fixed per-step cost</text>
+    <!-- axes -->
+    <line x1="90" y1="60" x2="90" y2="310" stroke="#2a3040" stroke-width="1.5"/>
+    <line x1="90" y1="310" x2="880" y2="310" stroke="#2a3040" stroke-width="1.5"/>
+    <!-- y ticks -->
+    <text x="80" y="314" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="end">0</text>
+    <text x="80" y="200" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="end">20</text>
+    <text x="80" y="115" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="end">35</text>
+    <text x="80" y="90" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="end">tok/s</text>
+    <!-- gridlines -->
+    <line x1="90" y1="200" x2="880" y2="200" stroke="#2a3040" stroke-width="1" stroke-dasharray="3 5" opacity="0.6"/>
+    <line x1="90" y1="115" x2="880" y2="115" stroke="#2a3040" stroke-width="1" stroke-dasharray="3 5" opacity="0.6"/>
+    <!-- x ticks: load sweep -->
+    <text x="170" y="330" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="middle">conc4</text>
+    <text x="350" y="330" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="middle">conc8</text>
+    <text x="530" y="330" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="middle">conc16 / ISL2048</text>
+    <text x="730" y="330" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="middle">conc32</text>
+    <text x="485" y="356" fill="#9aa4b8" font-family="monospace" font-size="12" text-anchor="middle">increasing load (concurrency × input length) ──►</text>
+
+    <!-- dense flat line @ 27.6 -> y = 310 - 27.6/35*195 = 310 - 153.8 = 156.2 -->
+    <line x1="90" y1="156" x2="880" y2="156" stroke="#46c98b" stroke-width="2.5"/>
+    <circle cx="170" cy="156" r="4" fill="#46c98b"/><circle cx="350" cy="156" r="4" fill="#46c98b"/>
+    <circle cx="530" cy="156" r="4" fill="#46c98b"/><circle cx="730" cy="156" r="4" fill="#46c98b"/>
+    <text x="888" y="152" fill="#46c98b" font-family="monospace" font-size="12" font-weight="700">dense 27.6</text>
+
+    <!-- deepep flat line @ 19.6 -> y = 310 - 19.6/35*195 = 310 - 109.2 = 200.8 -->
+    <line x1="90" y1="201" x2="880" y2="201" stroke="#ff8a5c" stroke-width="2.5"/>
+    <circle cx="170" cy="201" r="4" fill="#ff8a5c"/><circle cx="350" cy="201" r="4" fill="#ff8a5c"/>
+    <circle cx="530" cy="201" r="4" fill="#ff8a5c"/><circle cx="730" cy="201" r="4" fill="#ff8a5c"/>
+    <text x="888" y="214" fill="#ff8a5c" font-family="monospace" font-size="12" font-weight="700">DeepEP 19.6</text>
+
+    <!-- the gap bracket -->
+    <line x1="610" y1="156" x2="610" y2="201" stroke="#ef6f6f" stroke-width="1.5"/>
+    <line x1="605" y1="156" x2="615" y2="156" stroke="#ef6f6f" stroke-width="1.5"/>
+    <line x1="605" y1="201" x2="615" y2="201" stroke="#ef6f6f" stroke-width="1.5"/>
+    <rect x="624" y="166" width="176" height="26" rx="5" fill="#0b0e15" stroke="#ef6f6f"/>
+    <text x="712" y="183" fill="#ef6f6f" font-family="monospace" font-size="12" font-weight="700" text-anchor="middle">+14.7 ms/token tax</text>
+  </svg>
+  <p class="figcap"><b>Constancy is the evidence.</b> If the gap were queueing or contention, it would grow with
+  load. It does not. A throughput that is flat in tok/s across a 8× concurrency range and a 17× ISL range can only
+  be explained by a <b>fixed per-decode-step cost</b> — the CPU-proxy host round-trip, paid once per token step
+  regardless of how much work surrounds it. The arithmetic:
+  <code>1000/19.6 − 1000/27.6 = 51.0 − 36.3 = +14.7&nbsp;ms/token</code> <span class="pill d">derived</span>.
+  Measured DeepEP/dense ratios: <b>0.65× (conc4) · 0.69× (conc32) · 0.67× (conc16/ISL2048)</b>
+  <span class="pill m">measured</span> — three regimes, same tax.</p>
+
+  <div class="warnbox">
+    <b>Why DeepEP's byte-reduction can't pay this back.</b> DeepEP genuinely moves fewer bytes than dense
+    all-to-all — that is real and measurable at the transport layer (prefill dispatch hits 33 GB/s SO,
+    <span class="pill m">measured</span>). But the decode tax is a <i>latency</i> per step, not a <i>bandwidth</i>
+    cost. Saving bytes on an issue-bound, 97.8%-idle wire saves nothing on the clock that gates decode tok/s. The
+    benefit is real in bytes and never reaches the user as tok/s.
+  </div>
+
+  <!-- ============================================================ 5. WHAT WOULD CLOSE THE GAP ============================================================ -->
+  <h2>5 · What would close the gap — GDAKI, and why it isn't shipped</h2>
+  <p class="sub">There is exactly one thing that removes the tax: a <b>kernel-posted WQE on EFA</b> — the EFA
+  analogue of InfiniBand's IBGDA, called <b>GDAKI</b> (GPU-Direct Async, kernel-initiated). If the GPU could ring
+  the NIC doorbell itself, the host round-trip disappears and <code>t_op</code> collapses toward the IBGDA figure
+  in §2. The honest status: <b>part of it works, the part you need does not.</b></p>
+
+  <div class="twocol">
+    <div class="is"><b>What works on EFA via GDAKI</b>
+      <ul>
+        <li>Cross-node <b>BARRIER</b> — end-to-end, 16/16 ranks, <span class="key-efa">~19 µs measured</span>
+          <span class="pill m">measured</span>. The kernel-posted-WQE wire <i>is</i> capable of carrying
+          GDAKI traffic; the barrier proves the doorbell path exists.</li>
+        <li>Plugin MR registration on the <code>efa-direct</code> provider, per-peer/per-NIC rkey allgather.</li>
+      </ul>
+    </div>
+    <div class="isnot"><b>What does NOT work — DISPATCH</b>
+      <ul>
+        <li>Cross-node <b>DISPATCH</b> via GDAKI. DeepEP's dispatch needs the signal/count primitives, and those
+          ride exactly the SRD limits from §1 — <b>no atomics</b> (the DOCA <code>put_signal</code> fetch-add is
+          dropped) and <b>no ordering</b> (the in-order receiver stalls). Today, dispatch <b>must</b> use the
+          CPU&nbsp;proxy (<code>NCCL_GIN_TYPE=2</code>).</li>
+      </ul>
+    </div>
+  </div>
+
+  <p class="sub" style="margin-top:14px">And even the doorbell path that the barrier uses is not a free upgrade:
+  the hardware-counter completion path GDAKI dispatch would need depends on a <b>three-layer stack that is not
+  shipped</b> end-to-end:</p>
+
+  <div class="diag">  GDAKI hardware-counter completion path — the 3 missing layers
+  ───────────────────────────────────────────────────────────────
+  ① rdma-core    needs  ibv_create_comp_cntr / efadv_comp_cntr_init_attr   ──►  AWS-internal fork only, zero public PRs
+  ② libfabric    needs  PR #12114 "prov/efa: support hardware counter"      ──►  open, mergeable, not released
+  ③ aws-ofi-nccl needs  gin-gdaki-signals (#if HAVE_FI_EFA_COMP_CNTR)       ──►  compiles to a no-op without ① + ②
+
+  Result: each layer silently degrades without the one below it.
+          The kernel-posted-WQE dispatch path is upstream-gated, not a config flag.</div>
+  <p class="figcap">Combined with SRD's no-ordering / no-atomics, this is why <b>the proxy is mandatory on EFA
+  today</b> for dispatch. GDAKI is the right answer architecturally — it is simply not a shipping option on this
+  fabric yet. Anyone telling you to "just turn on GPU-initiated dispatch on EFA" is describing InfiniBand.</p>
+
+  <!-- ============================================================ 6. STACK DIAGRAM ============================================================ -->
+  <h2>6 · The two data paths, layer by layer</h2>
+  <p class="sub">Putting it together: the EFA path traverses the full host stack on every all-to-all op; the IBGDA
+  path skips the host entirely. The latency lives in the layers the orange path must climb and the violet path
+  does not.</p>
+
+  <svg viewBox="0 0 920 470" role="img" aria-label="Layered stack diagram comparing the EFA CPU-proxy data path against the InfiniBand IBGDA kernel-posted path">
+    <!-- column headers -->
+    <rect x="40" y="20" width="380" height="34" rx="7" fill="#3a2418" stroke="#ff8a5c"/>
+    <text x="230" y="42" fill="#ff8a5c" font-family="SFMono-Regular,Consolas,monospace" font-size="13" font-weight="700" text-anchor="middle">AWS EFA · SRD — host-proxied (today)</text>
+    <rect x="500" y="20" width="380" height="34" rx="7" fill="#2a1f3d" stroke="#b07bff"/>
+    <text x="690" y="42" fill="#b07bff" font-family="SFMono-Regular,Consolas,monospace" font-size="13" font-weight="700" text-anchor="middle">InfiniBand · IBGDA — kernel-posted</text>
+
+    <!-- ===== EFA column: 5 boxes the op must climb ===== -->
+    <!-- GPU kernel -->
+    <rect x="40" y="72" width="380" height="40" rx="6" fill="#1e2230" stroke="#2a3040"/>
+    <text x="56" y="97" fill="#e8ecf4" font-family="monospace" font-size="12">GPU kernel — token routing</text>
+    <!-- D2H ring -->
+    <rect x="40" y="138" width="380" height="40" rx="6" fill="#1e2230" stroke="#ff8a5c"/>
+    <text x="56" y="163" fill="#e8ecf4" font-family="monospace" font-size="12">D2H ring — kernel writes a slot</text>
+    <text x="404" y="163" fill="#ff8a5c" font-family="monospace" font-size="11" text-anchor="end">+latency</text>
+    <!-- CPU proxy -->
+    <rect x="40" y="204" width="380" height="40" rx="6" fill="#1e2230" stroke="#ff8a5c"/>
+    <text x="56" y="229" fill="#e8ecf4" font-family="monospace" font-size="12">CPU proxy — single-threaded poll + post</text>
+    <text x="404" y="229" fill="#ff8a5c" font-family="monospace" font-size="11" text-anchor="end">+latency</text>
+    <!-- libfabric -->
+    <rect x="40" y="270" width="380" height="40" rx="6" fill="#1e2230" stroke="#ff8a5c"/>
+    <text x="56" y="295" fill="#e8ecf4" font-family="monospace" font-size="12">libfabric — fi_writedata → efa-direct</text>
+    <text x="404" y="295" fill="#ff8a5c" font-family="monospace" font-size="11" text-anchor="end">+latency</text>
+    <!-- EFA NIC -->
+    <rect x="40" y="336" width="380" height="40" rx="6" fill="#1e2230" stroke="#2a3040"/>
+    <text x="56" y="361" fill="#e8ecf4" font-family="monospace" font-size="12">EFA NIC — posts to wire</text>
+    <!-- SRD wire -->
+    <rect x="40" y="402" width="380" height="40" rx="6" fill="#11141d" stroke="#ff8a5c"/>
+    <text x="56" y="427" fill="#ff8a5c" font-family="monospace" font-size="12" font-weight="700">SRD wire — 97.8% idle (issue-bound)</text>
+    <!-- arrows down EFA -->
+    <g stroke="#ff8a5c" stroke-width="1.8" fill="#ff8a5c">
+      <line x1="230" y1="112" x2="230" y2="136"/><polygon points="226,136 234,136 230,142"/>
+      <line x1="230" y1="178" x2="230" y2="202"/><polygon points="226,202 234,202 230,208"/>
+      <line x1="230" y1="244" x2="230" y2="268"/><polygon points="226,268 234,268 230,274"/>
+      <line x1="230" y1="310" x2="230" y2="334"/><polygon points="226,334 234,334 230,340"/>
+      <line x1="230" y1="376" x2="230" y2="400"/><polygon points="226,400 234,400 230,406"/>
+    </g>
+    <!-- host-roundtrip brace -->
+    <path d="M 28 138 q -10 0 -10 12 v 88 q 0 12 -10 12 q 10 0 10 12 v 88 q 0 12 10 12" fill="none" stroke="#ef6f6f" stroke-width="1.5"/>
+    <text x="-138" y="262" transform="rotate(-90 12 262)" fill="#ef6f6f" font-family="monospace" font-size="11" font-weight="700">host round-trip, per op</text>
+
+    <!-- ===== IBGDA column: GPU rings the doorbell directly ===== -->
+    <!-- GPU kernel -->
+    <rect x="500" y="72" width="380" height="40" rx="6" fill="#1e2230" stroke="#b07bff"/>
+    <text x="516" y="97" fill="#e8ecf4" font-family="monospace" font-size="12">GPU kernel — builds WQE + rings doorbell</text>
+    <!-- the skip -->
+    <rect x="500" y="138" width="380" height="172" rx="8" fill="#11141d" stroke="#2a3040" stroke-dasharray="4 5"/>
+    <text x="690" y="218" fill="#9aa4b8" font-family="monospace" font-size="12" text-anchor="middle">D2H ring · CPU proxy · libfabric</text>
+    <text x="690" y="240" fill="#b07bff" font-family="monospace" font-size="13" text-anchor="middle" font-weight="700">— skipped entirely —</text>
+    <text x="690" y="262" fill="#9aa4b8" font-family="monospace" font-size="11" text-anchor="middle">no host on the data path</text>
+    <!-- IB NIC -->
+    <rect x="500" y="336" width="380" height="40" rx="6" fill="#1e2230" stroke="#2a3040"/>
+    <text x="516" y="361" fill="#e8ecf4" font-family="monospace" font-size="12">IB HCA — kernel-posted WQE, WriteImm</text>
+    <!-- IB wire -->
+    <rect x="500" y="402" width="380" height="40" rx="6" fill="#11141d" stroke="#b07bff"/>
+    <text x="516" y="427" fill="#b07bff" font-family="monospace" font-size="12" font-weight="700">RC wire — ordered, atomic, ~1 doorbell + 1 RTT</text>
+    <!-- arrows IB: kernel straight to NIC -->
+    <g stroke="#b07bff" stroke-width="1.8" fill="#b07bff">
+      <line x1="690" y1="112" x2="690" y2="136"/><polygon points="686,136 694,136 690,142"/>
+      <line x1="690" y1="310" x2="690" y2="334"/><polygon points="686,334 694,334 690,340"/>
+      <line x1="690" y1="376" x2="690" y2="400"/><polygon points="686,400 694,400 690,406"/>
+    </g>
+    <!-- fast-path brace -->
+    <path d="M 892 72 q 10 0 10 12 v 152 q 0 12 10 12 q -10 0 -10 12 v 152 q 0 12 -10 12" fill="none" stroke="#46c98b" stroke-width="1.5"/>
+    <text x="900" y="262" transform="rotate(90 904 262)" fill="#46c98b" font-family="monospace" font-size="11" font-weight="700">~1.5–2 µs, pipelined</text>
+  </svg>
+  <p class="figcap"><span class="swatch" style="background:#ff8a5c"></span><b>EFA (orange):</b> every op climbs five
+  layers — kernel → D2H ring → CPU proxy → libfabric → NIC — before reaching the wire, and the wire sits 97.8%
+  idle waiting for the next issue. <span class="swatch" style="background:#b07bff"></span><b>IBGDA (violet):</b>
+  the kernel posts the WQE and rings the doorbell directly; the entire host segment is skipped. The latency this
+  whole section quantifies is exactly the height of the orange stack that the violet path does not climb. The
+  D2H ring, CPU proxy, and libfabric layers are <span class="pill m">measured</span> on the live path; the IBGDA
+  per-op figure is <span class="pill d">derived</span> from the §2 model.</p>
+
+  <hr class="rule"/>
+
+  <div class="panel">
+    <b>Takeaway.</b> EFA and InfiniBand have comparable bandwidth (400 GB/s/node here), but MoE dispatch is
+    issue-bound, not bandwidth-bound. On EFA today the CPU proxy adds a <b>fixed +14.7 ms/token</b> decode tax
+    that is load-invariant and cannot be paid back by DeepEP's byte savings, because the wire is already 97.8%
+    idle. The only architectural fix — GDAKI kernel-posted WQE — works for barrier but not dispatch, and is gated
+    behind an unshipped three-layer stack plus SRD's missing ordering and atomics. On this fabric, the host proxy
+    is mandatory for dispatch.
+  </div>
+
+  <a class="next" href="03-scaling.html">Next: §3 Scaling ▸</a>
+
+  <div class="foot">
+    All measured values from the efa-gda campaign: 2× p5en.48xlarge, AWS EFA (16 NICs/node, 25 GB/s/NIC effective
+    per PR&nbsp;#612), Qwen3-30B-A3B-FP8 EP16 unless noted. EFA SRD ground truth: no atomics, no ordering, CQ-local,
+    1-SGE RDMA write. Sources: <code>docs/invariants.md</code>, <code>deepep-calculator/MEASURED-DATA.md</code>.
+    Provenance tags — <span class="pill m">measured</span> on hardware ·
+    <span class="pill d">derived</span> by arithmetic from measured values ·
+    <span class="pill a">assumed</span> pending verification.
+  </div>
+
+</div>
+</body>
+</html>

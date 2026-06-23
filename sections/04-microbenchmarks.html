@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§4 · Microbenchmarks + real inference numbers — DeepEP on EFA</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  /* section-local helpers only — design tokens come from site.css */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .kpi{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:13px 14px}
+  .kpi .n{font:22px/1.1 var(--mono);font-weight:700}
+  .kpi .l{font-size:11px;color:var(--mut);margin-top:5px;text-transform:uppercase;letter-spacing:.4px}
+  .src{font:11px var(--mono);color:var(--mut)}
+  td .src{display:block;margin-top:2px}
+  .num{font:12px var(--mono)}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px}
+  caption{caption-side:top;text-align:left;color:var(--mut);font-size:12px;padding:4px 0}
+  .ratio-tie{color:var(--warn);font-weight:700}
+  .ratio-lose{color:var(--bad);font-weight:700}
+  .ratio-win{color:var(--good);font-weight:700}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <span class="brand">DeepEP on EFA</span>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">01 · What is DeepEP</a>
+    <a href="02-efa-vs-infiniband.html">02 · IB vs EFA</a>
+    <a href="03-scaling.html">03 · Drop-in</a>
+    <a href="04-microbenchmarks.html" style="color:var(--ink)">04 · Microbenchmarks</a>
+    <a href="05-alternatives.html">05 · Alternatives</a>
+    <a href="06-solution-arch.html">06 · Recipe</a>
+    <a href="../calculator/">Calculator</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <h1>§4 · Microbenchmarks + real inference numbers</h1>
+  <p class="sub">This is the evidence section. Every number below is <span class="pill m">measured</span> on the
+  efa-gda campaign — <b>2× p5en.48xlarge, AWS EFA, Qwen3-30B-A3B-FP8 EP16</b> — and cites the experiment record it
+  came from. The arc is one finding, measured two ways: at the <b>transport layer</b> DeepEP's O(top-k) volume
+  reduction is real (and UCCL is ~4× faster still); at the <b>serving layer</b> none of it converts — DeepEP ties
+  or loses on tokens/second. The wire is 98% idle; the path is issue-bound, not bandwidth-bound.</p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="n good">33–35</div><div class="l">SO GB/s prefill · shipped ceiling (multi-comm)</div></div>
+    <div class="kpi"><div class="n warn">10–12</div><div class="l">SO GB/s decode · shipped ceiling</div></div>
+    <div class="kpi"><div class="n">113</div><div class="l">GB/s node injection ceiling — silicon is not the limit</div></div>
+    <div class="kpi"><div class="n bad">~2.2%</div><div class="l">EFA NIC utilization — issue-bound, not wire-bound</div></div>
+  </div>
+
+  <!-- ============================================================ 1. TRANSPORT MICROBENCH -->
+  <h2>1 · Transport-layer microbenchmarks <span class="pill m">measured</span></h2>
+  <p class="sub">DeepEP-V2 <code>test_ep</code> all-to-all bandwidth, split by path and regime.
+  <b>SO</b> = scale-out (cross-node, over EFA SRD). <b>SU</b> = scale-up (intra-node, over NVLink).
+  Prefill carries 4096 tokens/rank; decode carries 128. The shipped numbers use the <code>EP_NUM_COMMS=8</code>
+  multi-comm knob (K=8 NCCL-GIN progress threads behind the ElasticBuffer wall); the raw floor is the single-comm
+  path before that knob.</p>
+
+  <table>
+    <caption>DeepEP-V2 dispatch / combine bandwidth, GB/s. SU is NVLink intra-node; SO is cross-node over EFA.</caption>
+    <tr>
+      <th>path</th><th>regime</th>
+      <th>SO (cross-node EFA)</th><th>SU (NVLink)</th>
+      <th>raw floor (single-comm)</th><th>source</th>
+    </tr>
+    <tr>
+      <td>dispatch</td><td>prefill (4096 tok)</td>
+      <td class="num good">33–35</td><td class="num">110–117</td>
+      <td class="num bad">1–7</td>
+      <td class="src">EXP-G40 · EXP-AB-MULTICOMM-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>dispatch</td><td>decode (128 tok)</td>
+      <td class="num warn">10–12</td><td class="num">24–25</td>
+      <td class="num bad">1–7</td>
+      <td class="src">EXP-LOOP2-BASELINE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>combine</td><td>prefill (4096 tok)</td>
+      <td class="num good">27–28</td><td class="num">88.7</td>
+      <td class="num bad">1–7</td>
+      <td class="src">EXP-AB-MULTICOMM-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>combine</td><td>decode (128 tok)</td>
+      <td class="num warn">10–12</td><td class="num">24–25</td>
+      <td class="num bad">1–7</td>
+      <td class="src">EXP-LOOP2-BASELINE-2026-06-23</td>
+    </tr>
+  </table>
+
+  <div class="twocol">
+    <div class="panel">
+      <h3>The 3.3× cross-node penalty</h3>
+      <p class="sub" style="margin:0">SO/SU ≈ <b>0.30</b> on dispatch — the same payload moves <b>3.3× slower</b>
+      cross-node (EFA) than intra-node (NVLink). That gap is the whole problem this site is about. It is
+      <i>not</i> the wire: the same 16-NIC node injects <b>113 GB/s</b> when measured directly (EXP-G40). The
+      penalty lives in the per-op post rate through the CPU proxy + libfabric, not in EFA's bandwidth.</p>
+    </div>
+    <div class="panel">
+      <h3>Multi-comm is the lever, and it tops out</h3>
+      <p class="sub" style="margin:0"><code>EP_NUM_COMMS</code> stripes K independent NCCL-GIN progress threads:
+      <span class="num">K=1 ≈ 8</span> → <span class="num">K=2 = 12–13</span> (1.7×) →
+      <span class="num">K=4 = 21</span> → <span class="num">K=8 = 33</span> SO (4.3×, peak). Both prefill and
+      decode peak at K=8; past that, per-thread issue efficiency is the ceiling. This is the recommended way to
+      <i>run</i> DeepEP on EFA. <span class="src">EXP-AB-MULTICOMM-2026-06-23</span></p>
+    </div>
+  </div>
+
+  <!-- transport bandwidth bar chart -->
+  <svg viewBox="0 0 1000 300" role="img" aria-label="DeepEP-V2 transport bandwidth by path and regime, SO vs SU vs raw floor">
+    <text x="20" y="28" fill="#e8ecf4" font-size="15" font-weight="700">Transport bandwidth — SO (EFA) vs SU (NVLink) vs raw floor</text>
+    <text x="20" y="48" fill="#9aa4b8" font-size="11" font-family="monospace">GB/s · log-ish linear to 120 · node injection ceiling 113 GB/s drawn as reference</text>
+
+    <!-- ceiling reference line at 113 of 120 scale -->
+    <!-- plot area x:[150,950] y:[70,250]; value 0..120 -> x = 150 + v/120*800 -->
+    <line x1="150" y1="70" x2="150" y2="262" stroke="#2a3040" stroke-width="1"/>
+    <!-- gridlines -->
+    <g stroke="#1c2230" stroke-width="1" font-family="monospace" font-size="10" fill="#6b7689">
+      <line x1="283" y1="70" x2="283" y2="262"/><text x="283" y="278" text-anchor="middle">20</text>
+      <line x1="417" y1="70" x2="417" y2="262"/><text x="417" y="278" text-anchor="middle">40</text>
+      <line x1="550" y1="70" x2="550" y2="262"/><text x="550" y="278" text-anchor="middle">60</text>
+      <line x1="683" y1="70" x2="683" y2="262"/><text x="683" y="278" text-anchor="middle">80</text>
+      <line x1="817" y1="70" x2="817" y2="262"/><text x="817" y="278" text-anchor="middle">100</text>
+      <line x1="950" y1="70" x2="950" y2="262"/><text x="950" y="278" text-anchor="middle">120</text>
+    </g>
+    <!-- 113 ceiling: x = 150 + 113/120*800 = 903 -->
+    <line x1="903" y1="64" x2="903" y2="268" stroke="#46c98b" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="898" y="62" fill="#46c98b" font-size="10" font-family="monospace" text-anchor="end">113 GB/s node ceiling (silicon)</text>
+
+    <!-- rows: each path/regime gets SO + SU + floor stacked. bar height 12, gap. row y centers -->
+    <!-- helper: x for value v = 150 + v/120*800 -->
+    <!-- dispatch prefill SO 34 -> 150+34/120*800=377 ; SU 113.5->~907(clamp to 113->903); floor 4->177 -->
+    <g font-family="monospace" font-size="11">
+      <!-- row 1: dispatch prefill -->
+      <text x="142" y="92" fill="#9aa4b8" text-anchor="end">disp · prefill</text>
+      <rect x="150" y="84" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="84" width="227" height="9" rx="2" fill="#ff8a5c"/><text x="384" y="92" fill="#ff8a5c">34 SO</text>
+      <rect x="150" y="96" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="96" width="757" height="9" rx="2" fill="#6ea8fe"/><text x="900" y="104" fill="#6ea8fe" text-anchor="end">110–117 SU (NVLink, clamped)</text>
+
+      <!-- row 2: dispatch decode -->
+      <text x="142" y="128" fill="#9aa4b8" text-anchor="end">disp · decode</text>
+      <rect x="150" y="120" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="120" width="73" height="9" rx="2" fill="#ff8a5c"/><text x="230" y="128" fill="#ff8a5c">11 SO</text>
+      <rect x="150" y="132" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="132" width="166" height="9" rx="2" fill="#6ea8fe"/><text x="323" y="140" fill="#6ea8fe">24–25 SU</text>
+
+      <!-- row 3: combine prefill -->
+      <text x="142" y="164" fill="#9aa4b8" text-anchor="end">comb · prefill</text>
+      <rect x="150" y="156" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="156" width="183" height="9" rx="2" fill="#ff8a5c"/><text x="340" y="164" fill="#ff8a5c">27 SO</text>
+      <rect x="150" y="168" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="168" width="591" height="9" rx="2" fill="#6ea8fe"/><text x="748" y="176" fill="#6ea8fe">88.7 SU</text>
+
+      <!-- row 4: combine decode -->
+      <text x="142" y="200" fill="#9aa4b8" text-anchor="end">comb · decode</text>
+      <rect x="150" y="192" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="192" width="73" height="9" rx="2" fill="#ff8a5c"/><text x="230" y="200" fill="#ff8a5c">11 SO</text>
+      <rect x="150" y="204" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="204" width="166" height="9" rx="2" fill="#6ea8fe"/><text x="323" y="212" fill="#6ea8fe">24–25 SU</text>
+
+      <!-- raw floor band -->
+      <text x="142" y="240" fill="#9aa4b8" text-anchor="end">raw floor (K=1)</text>
+      <rect x="150" y="232" width="753" height="9" rx="2" fill="#13202c"/>
+      <rect x="150" y="232" width="47" height="9" rx="2" fill="#ef6f6f"/><text x="204" y="240" fill="#ef6f6f">1–7 single-comm</text>
+    </g>
+
+    <!-- legend -->
+    <g font-family="monospace" font-size="10">
+      <rect x="150" y="288" width="10" height="10" rx="2" fill="#ff8a5c"/><text x="166" y="297" fill="#9aa4b8">SO · cross-node EFA</text>
+      <rect x="320" y="288" width="10" height="10" rx="2" fill="#6ea8fe"/><text x="336" y="297" fill="#9aa4b8">SU · intra-node NVLink</text>
+      <rect x="510" y="288" width="10" height="10" rx="2" fill="#ef6f6f"/><text x="526" y="297" fill="#9aa4b8">raw floor (no multi-comm)</text>
+    </g>
+  </svg>
+  <p class="legend">Cross-node SO bars (orange) sit far below the NVLink SU bars (blue) and far, far below the
+  113 GB/s node injection ceiling (green dashed). The bottleneck is the plugin/proxy issue path — not EFA silicon.</p>
+
+  <!-- ============================================================ 2. REAL INFERENCE / AIPERF -->
+  <h2>2 · Real inference numbers <span class="pill m">measured</span></h2>
+  <p class="sub">The transport bytes don't tell you what a user sees. These are end-to-end serving A/B runs —
+  DeepEP vs the <i>same framework's</i> dense / allgather path, identical model + build + nodes — measured with
+  <b>AIPerf 0.10.0</b>, backend-asserted (the framework provably instantiates <code>ElasticBuffer</code> on EFA,
+  not a silent fallback). Aggregate tokens/second, per-user tokens/second, and time-to-first-token.</p>
+
+  <table>
+    <caption>Serving A/B — DeepEP vs same-framework dense. agg = aggregate tok/s across all users. Ratio &lt;1 means DeepEP is slower.</caption>
+    <tr>
+      <th>framework</th><th>DeepEP backend vs dense</th><th>regime</th>
+      <th>DeepEP agg</th><th>dense agg</th><th>DeepEP / dense</th><th>source</th>
+    </tr>
+    <tr>
+      <td>TRT-LLM 0.21</td><td>ElasticBuffer GIN-V2 vs allgather</td><td>conc4 / ISL120 / EP16</td>
+      <td class="num">64.24</td><td class="num">106.36</td><td class="num ratio-lose">0.60×</td>
+      <td class="src">EXP-AB-TRTLLM-DEEPEP-VS-DENSE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>TRT-LLM 0.21</td><td>DeepEP + EP_NUM_COMMS=8 vs dense</td><td>conc4 / ISL120 / EP16</td>
+      <td class="num">68.7</td><td class="num">105.66</td><td class="num ratio-lose">0.65×</td>
+      <td class="src">EXP-AB-TRTLLM-DEEPEP-VS-DENSE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>TRT-LLM 0.21</td><td>DeepEP-mc8 vs dense</td><td>conc32 / ISL120 / EP16</td>
+      <td class="num">545.04</td><td class="num">794.56</td><td class="num ratio-lose">0.69×</td>
+      <td class="src">EXP-AB-TRTLLM-DEEPEP-VS-DENSE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>TRT-LLM 0.21</td><td>DeepEP-mc8 vs dense</td><td>conc16 / ISL2048 / EP16</td>
+      <td class="num">284.22</td><td class="num">424.67</td><td class="num ratio-lose">0.67×</td>
+      <td class="src">EXP-AB-TRTLLM-DEEPEP-VS-DENSE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>vLLM</td><td>deepep_v2 (EPNC8) vs allgather_reducescatter</td><td>conc32 / decode / EP16</td>
+      <td class="num">296</td><td class="num">304</td><td class="num ratio-tie">0.97× (TIE)</td>
+      <td class="src">EXP-AB-DEEPEP-MULTICOMM-VS-DENSE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>vLLM</td><td>deepep_v2 (EPNC8) vs allgather_reducescatter</td><td>conc64 / prefill / EP16</td>
+      <td class="num">18201</td><td class="num">22797</td><td class="num ratio-lose">0.80×</td>
+      <td class="src">EXP-AB-DEEPEP-MULTICOMM-VS-DENSE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>vLLM</td><td>deepep_v2 vs allgather_reducescatter</td><td>EP32 prefill (4-node)</td>
+      <td class="num mut">—</td><td class="num mut">—</td><td class="num ratio-tie">1.02× (TIE)</td>
+      <td class="src">EXP-AB-DEEPEP-MULTICOMM-VS-DENSE-2026-06-23</td>
+    </tr>
+    <tr>
+      <td>vLLM</td><td>deepep_v2 vs allgather_reducescatter</td><td>EP32 decode</td>
+      <td class="num mut">—</td><td class="num mut">—</td><td class="num ratio-tie">1.00× (TIE)</td>
+      <td class="src">EXP-AB-DEEPEP-MULTICOMM-VS-DENSE-2026-06-23</td>
+    </tr>
+  </table>
+
+  <div class="warnbox">
+    <b>The per-user signature — a fixed CPU-proxy tax.</b> DeepEP per-user throughput is <b>flat at 19.4–19.7
+    tok/s</b> (σ=0.13) while dense is <b>flat at 26.9–28.1 tok/s</b> (σ=0.51), unchanged across conc4→32 and
+    ISL120→2048. The difference is a constant <b>+14.7 ms/token</b> proxy round-trip. That it is <i>constant</i>
+    across every regime is the evidence it is a fixed per-decode-step cost, not noise — and a fixed per-step cost
+    cannot be amortized by batching. <span class="src">EXP-AIPERF-SGLANG-AB-2026-06-20</span>
+  </div>
+
+  <h3>TTFT degrades as input length grows <span class="pill m">measured</span></h3>
+  <p class="sub">Time-to-first-token is where the per-step proxy tax shows up most sharply: the dispatch happens on
+  every prefill step too, and longer inputs mean more steps before the first token. DeepEP's TTFT is
+  progressively worse than dense as ISL grows.</p>
+
+  <!-- TTFT degradation chart -->
+  <svg viewBox="0 0 1000 280" role="img" aria-label="DeepEP TTFT relative to dense, worsening with input length">
+    <text x="20" y="28" fill="#e8ecf4" font-size="15" font-weight="700">DeepEP TTFT relative to dense (lower is better; 1.0 = parity)</text>
+    <text x="20" y="48" fill="#9aa4b8" font-size="11" font-family="monospace">ratio of DeepEP TTFT ÷ dense TTFT · by input-sequence-length regime</text>
+
+    <!-- plot x:[120,940] y:[70,230]; ratio 0..3.5 -> y = 230 - r/3.5*150 ; bars vertical -->
+    <line x1="120" y1="230" x2="940" y2="230" stroke="#2a3040" stroke-width="1"/>
+    <line x1="120" y1="60" x2="120" y2="230" stroke="#2a3040" stroke-width="1"/>
+    <!-- y gridlines ratio 1,2,3 -->
+    <g stroke="#1c2230" font-family="monospace" font-size="10" fill="#6b7689">
+      <line x1="120" y1="187" x2="940" y2="187"/><text x="112" y="191" text-anchor="end">1.0×</text>
+      <line x1="120" y1="144" x2="940" y2="144"/><text x="112" y="148" text-anchor="end">2.0×</text>
+      <line x1="120" y1="101" x2="940" y2="101"/><text x="112" y="105" text-anchor="end">3.0×</text>
+    </g>
+    <!-- parity line emphasized -->
+    <line x1="120" y1="187" x2="940" y2="187" stroke="#46c98b" stroke-width="1.3" stroke-dasharray="6 4"/>
+    <text x="935" y="183" fill="#46c98b" font-size="10" font-family="monospace" text-anchor="end">parity with dense</text>
+
+    <!-- three bars: 1.05 short, 1.49 mid, 3.14 ISL2048. y for ratio r = 230 - r/3.5*150 -->
+    <!-- r=1.05 -> 185 ; r=1.49 -> 166 ; r=3.14 -> 95 -->
+    <g font-family="monospace" font-size="12">
+      <rect x="220" y="185" width="120" height="45" rx="3" fill="#f0b357"/>
+      <text x="280" y="172" fill="#f0b357" text-anchor="middle" font-weight="700">1.05×</text>
+      <text x="280" y="248" fill="#9aa4b8" text-anchor="middle" font-size="11">short ISL</text>
+
+      <rect x="450" y="166" width="120" height="64" rx="3" fill="#f0975c"/>
+      <text x="510" y="153" fill="#f0975c" text-anchor="middle" font-weight="700">1.49×</text>
+      <text x="510" y="248" fill="#9aa4b8" text-anchor="middle" font-size="11">mid ISL</text>
+
+      <rect x="680" y="95" width="120" height="135" rx="3" fill="#ef6f6f"/>
+      <text x="740" y="82" fill="#ef6f6f" text-anchor="middle" font-weight="700">3.14×</text>
+      <text x="740" y="248" fill="#9aa4b8" text-anchor="middle" font-size="11">ISL 2048</text>
+    </g>
+    <text x="120" y="270" fill="#9aa4b8" font-size="11" font-family="monospace">At ISL 2048, DeepEP first-token latency is 3.14× dense — the per-step dispatch tax compounds over prefill steps.</text>
+  </svg>
+  <p class="legend"><span class="pill m">measured</span> TTFT ratios 1.05× / 1.49× / 3.14× across the
+  short→mid→ISL2048 regimes. Source: <span class="src">EXP-AB-TRTLLM-DEEPEP-VS-DENSE-2026-06-23</span>. Lower is
+  better; the green dashed line is parity with the dense path.</p>
+
+  <!-- ============================================================ 3. DEEPEP vs UCCL vs PPLX -->
+  <h2>3 · DeepEP vs UCCL vs pplx <span class="pill m">measured</span></h2>
+  <p class="sub">Three expert-parallel transports on the same EFA hardware. UCCL uses a raw-ibverbs path; pplx is
+  the pplx-garden reference; DeepEP-V2 uses the CPU-proxy NCCL-GIN path. Measured two ways: a transport-layer
+  microbenchmark (µs per op) and a serving A/B (tokens/second through a real framework).</p>
+
+  <div class="warnbox">
+    <b>⚠ Caveat — the cross-bench µs are NOT apples-to-apples.</b> The three transports are timing
+    <i>different op shapes</i>: DeepEP measures a unified-dispatch; UCCL measures a low-latency send + recv; pplx
+    measures a round-trip. They are the <b>same order of magnitude</b> and useful for a rough rank, but the
+    microseconds are <b>not subtractable</b> across rows. Treat "~4× faster" as a coarse ratio, not a precise delta.
+  </div>
+
+  <table>
+    <caption>Transport microbenchmark — dispatch + combine latency, µs. Different op shapes per row (see caveat above).</caption>
+    <tr>
+      <th>transport</th><th>path</th>
+      <th>dispatch µs</th><th>combine µs</th><th>op shape (why not subtractable)</th><th>source</th>
+    </tr>
+    <tr>
+      <td>DeepEP-V2</td><td>CPU-proxy NCCL-GIN</td>
+      <td class="num">186</td><td class="num">264</td>
+      <td class="src">unified-dispatch (one fused op)</td>
+      <td class="src">EXP-UCCL-SGLANG-LIVE-2026-06-19</td>
+    </tr>
+    <tr>
+      <td>UCCL</td><td>raw-ibverbs</td>
+      <td class="num good">47</td><td class="num good">84</td>
+      <td class="src">low-latency send + recv (split)</td>
+      <td class="src">EXP-UCCL-SGLANG-LIVE-2026-06-19</td>
+    </tr>
+    <tr>
+      <td>pplx (pplx-garden)</td><td>reference kernels</td>
+      <td class="num">222</td><td class="num">362</td>
+      <td class="src">round-trip (matches published; no serve adapter)</td>
+      <td class="src">EXP-3c · EXP-3d-2026-06-19</td>
+    </tr>
+  </table>
+
+  <table>
+    <caption>Serving A/B — DeepEP-V2 vs UCCL, same framework (SGLang), ≥2-rep, decode variance &lt;1%.</caption>
+    <tr><th>concurrency</th><th>DeepEP-V2 agg tok/s</th><th>UCCL agg tok/s</th><th>DeepEP / UCCL</th><th>source</th></tr>
+    <tr>
+      <td>32</td><td class="num">263.9</td><td class="num">254.2</td><td class="num ratio-tie">1.038×</td>
+      <td class="src">EXP-UCCL-SGLANG-LIVE-2026-06-19</td>
+    </tr>
+    <tr>
+      <td>256</td><td class="num">2173.8</td><td class="num">2105.4</td><td class="num ratio-tie">1.032×</td>
+      <td class="src">EXP-UCCL-SGLANG-LIVE-2026-06-19</td>
+    </tr>
+  </table>
+  <p class="legend">Under standardized AIPerf, DeepEP is <b>1.03× aggregate</b> over UCCL and ~3% faster on ITL /
+  per-user — a statistical <b>TIE</b>, despite UCCL's ~4× transport-microbench edge. The all-to-all is not the
+  serving critical path.</p>
+
+  <!-- ============================================================ 4. THE CENTRAL FINDING CHART -->
+  <h2>4 · Transport speed ≠ serving speed <span class="pill m">measured</span></h2>
+  <p class="sub">This is the central finding of the campaign, in one picture. UCCL is <b>~4× faster than DeepEP at
+  the transport layer</b>. Run them through the <i>same serving stack</i> (SGLang, same model, same nodes) and that
+  4× edge collapses to <b>~1.0×</b> — a dead tie on tokens/second. A faster wire does not make a faster serve when
+  the wire is 98% idle and the bottleneck is somewhere else entirely.</p>
+
+  <svg viewBox="0 0 1000 380" role="img" aria-label="UCCL's 4x transport advantage collapses to a tie at the serving layer">
+    <text x="20" y="30" fill="#e8ecf4" font-size="16" font-weight="700">UCCL's 4× transport edge → ~1.0× at the serving layer</text>
+    <text x="20" y="50" fill="#9aa4b8" font-size="11" font-family="monospace">two grouped comparisons · DeepEP vs UCCL · normalized so DeepEP = 1.0 in each group</text>
+
+    <!-- two groups. Group A "TRANSPORT (faster=taller, inverse latency)", Group B "SERVING (agg tok/s)" -->
+    <!-- normalize: transport speed = 1/latency. DeepEP disp 186us -> speed 1.0 ; UCCL 47us -> 186/47 = 3.96x -->
+    <!-- serving: DeepEP 1.0 ; UCCL 254.2/263.9 = 0.96 (UCCL slightly slower -> DeepEP 1.03x). draw UCCL ~0.96 -->
+
+    <!-- plot baseline y=300 ; scale: value 0..4 -> height = v/4*220 ; bar y = 300-h -->
+    <line x1="80" y1="300" x2="960" y2="300" stroke="#2a3040" stroke-width="1.2"/>
+    <!-- y gridlines 1x..4x -->
+    <g stroke="#1c2230" font-family="monospace" font-size="10" fill="#6b7689">
+      <line x1="80" y1="245" x2="960" y2="245"/><text x="72" y="249" text-anchor="end">1×</text>
+      <line x1="80" y1="190" x2="960" y2="190"/><text x="72" y="194" text-anchor="end">2×</text>
+      <line x1="80" y1="135" x2="960" y2="135"/><text x="72" y="139" text-anchor="end">3×</text>
+      <line x1="80" y1="80"  x2="960" y2="80"/><text x="72" y="84"  text-anchor="end">4×</text>
+    </g>
+
+    <!-- GROUP A: TRANSPORT  (centered ~310) -->
+    <!-- DeepEP 1.0 -> h=55, y=245 ; UCCL 3.96 -> h=218, y=82 -->
+    <rect x="210" y="245" width="80" height="55" rx="3" fill="#6ea8fe"/>
+    <text x="250" y="237" fill="#6ea8fe" text-anchor="middle" font-family="monospace" font-weight="700">1.0×</text>
+    <text x="250" y="318" fill="#9aa4b8" text-anchor="middle" font-size="11" font-family="monospace">DeepEP</text>
+
+    <rect x="320" y="82" width="80" height="218" rx="3" fill="#b07bff"/>
+    <text x="360" y="74" fill="#b07bff" text-anchor="middle" font-family="monospace" font-weight="700">3.96×</text>
+    <text x="360" y="318" fill="#9aa4b8" text-anchor="middle" font-size="11" font-family="monospace">UCCL</text>
+
+    <text x="305" y="345" fill="#e8ecf4" text-anchor="middle" font-size="13" font-weight="700">TRANSPORT (microbench)</text>
+    <text x="305" y="363" fill="#9aa4b8" text-anchor="middle" font-size="10" font-family="monospace">dispatch µs: 186 vs 47 → UCCL ~4× faster</text>
+
+    <!-- divider -->
+    <line x1="540" y1="70" x2="540" y2="300" stroke="#2a3040" stroke-width="1" stroke-dasharray="3 5"/>
+
+    <!-- GROUP B: SERVING (centered ~720) -->
+    <!-- DeepEP 1.0 -> h=55 ; UCCL 0.96 -> h=53 -->
+    <rect x="640" y="245" width="80" height="55" rx="3" fill="#6ea8fe"/>
+    <text x="680" y="237" fill="#6ea8fe" text-anchor="middle" font-family="monospace" font-weight="700">1.0×</text>
+    <text x="680" y="318" fill="#9aa4b8" text-anchor="middle" font-size="11" font-family="monospace">DeepEP</text>
+
+    <rect x="750" y="247" width="80" height="53" rx="3" fill="#b07bff"/>
+    <text x="790" y="239" fill="#b07bff" text-anchor="middle" font-family="monospace" font-weight="700">0.96×</text>
+    <text x="790" y="318" fill="#9aa4b8" text-anchor="middle" font-size="11" font-family="monospace">UCCL</text>
+
+    <text x="735" y="345" fill="#e8ecf4" text-anchor="middle" font-size="13" font-weight="700">SERVING (AIPerf tok/s)</text>
+    <text x="735" y="363" fill="#9aa4b8" text-anchor="middle" font-size="10" font-family="monospace">agg tok/s: 263.9 vs 254.2 → DeepEP 1.03× (TIE)</text>
+
+    <!-- collapse arrow annotation -->
+    <path d="M 410 110 q 90 10 124 120" fill="none" stroke="#f0b357" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <polygon points="538,228 528,224 533,236" fill="#f0b357"/>
+    <text x="470" y="100" fill="#f0b357" font-size="11" font-family="monospace" text-anchor="middle">4× edge collapses ▾</text>
+
+    <rect x="80" y="288" width="10" height="10" rx="2" fill="#6ea8fe"/><text x="96" y="297" fill="#9aa4b8" font-size="10" font-family="monospace">DeepEP-V2</text>
+    <rect x="180" y="288" width="10" height="10" rx="2" fill="#b07bff"/><text x="196" y="297" fill="#9aa4b8" font-size="10" font-family="monospace">UCCL</text>
+  </svg>
+  <p class="legend">Bars normalized to DeepEP = 1.0 within each group. <span class="pill m">measured</span>
+  Transport: dispatch 186 µs (DeepEP) vs 47 µs (UCCL). Serving: 263.9 vs 254.2 agg tok/s (conc32).
+  Source: <span class="src">EXP-UCCL-SGLANG-LIVE-2026-06-19</span>. The 4× transport advantage does not survive
+  the trip to tokens/second — the all-to-all is not the serving critical path on EFA.</p>
+
+  <!-- ============================================================ 5. METHODOLOGY -->
+  <h2>5 · Methodology + honesty <span class="pill m">measured</span></h2>
+  <div class="twocol">
+    <div class="panel">
+      <h3>Setup</h3>
+      <ul>
+        <li><b>Hardware:</b> 2× p5en.48xlarge, AWS EFA (16 NICs/node, 25 GB/s/NIC effective, 113 GB/s node injection measured).</li>
+        <li><b>Model:</b> Qwen3-30B-A3B-FP8, EP16 (128 experts, top-8) unless a row says otherwise.</li>
+        <li><b>Tool:</b> AIPerf 0.10.0 for serving; DeepEP-V2 <code>test_ep</code> for transport.</li>
+        <li><b>Transport:</b> NCCL_GIN_TYPE=2, <code>deep_ep.ElasticBuffer</code>, EP_NUM_COMMS=8 (CPU-proxy NCCL-GIN). SRD: no atomics, no ordering, CQ-local, 1-SGE write.</li>
+        <li><b>Backend-asserted:</b> every serving cell verifies the framework instantiates <code>ElasticBuffer</code> on EFA — not a silent dense fallback that would look like DeepEP but isn't.</li>
+        <li><b>Isolated serves:</b> one backend per serve; no co-tenant interference on the measured pods.</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>What is and isn't statistically tight</h3>
+      <div class="is"><b>≥2-rep, var &lt;1%</b>
+        <ul>
+          <li>The DeepEP-vs-UCCL decode sweep (conc32 + conc256) is replicated, decode variance under 1%.</li>
+        </ul>
+      </div>
+      <div class="isnot" style="margin-top:10px"><b>n=1 (honest caveat)</b>
+        <ul>
+          <li>Most serving A/B cells are single-run. The evidence of reliability is the <b>cross-regime ratio
+          tightness</b>: per-user tok/s holds σ=0.13 (DeepEP) / σ=0.51 (dense) across conc4→32 and ISL120→2048.
+          A fixed ratio that survives every regime is the signal that the +14.7 ms/token tax is structural, not noise.</li>
+          <li>Cross-transport µs (§3) are different op shapes — same order of magnitude, not subtractable.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="warnbox">
+    <b>Bottom line.</b> DeepEP's transport advantage is real in <i>bytes</i> (1.45× over UCCL-published prefill;
+    O(top-k) volume reduction) and never reaches <i>tokens/second</i> on EFA. The CPU-proxy posts each cross-node
+    dispatch through the host; at ~2.2% NIC utilization the path is issue-bound, so cutting bytes doesn't cut the
+    per-step latency that gates decode. Only GPU-initiated transport (GDAKI/IBGDA) would remove the host round-trip
+    — and that is not available on EFA SRD today.
+  </div>
+
+  <p class="sub" style="margin-top:30px"><b>Next: <a href="05-alternatives.html">§5 Alternatives →</a></b></p>
+
+  <div class="foot">
+    All figures <span class="pill m">measured</span> on the efa-gda campaign (2× p5en.48xlarge, AWS EFA,
+    Qwen3-30B-A3B-FP8 EP16). Sourced per row in
+    <code>docs/experiments/EXP-*</code> and <code>deepep-calculator/MEASURED-DATA.md</code>.
+    Sanitized — no IPs, ECR account IDs, or hostnames.
+  </div>
+
+</div>
+</body>
+</html>
