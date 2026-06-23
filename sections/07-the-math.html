@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§7 · The Math — a quantitative model of MoE all-to-all on EFA vs InfiniBand</title>
+<link rel="stylesheet" href="../assets/site.css"/>
+<style>
+  .mathblock{font:13px/1.7 var(--mono);background:#0b0e15;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:14px 16px;margin:12px 0;overflow-x:auto;color:#c9d4ea}
+  .mathblock .lhs{color:var(--accent)} .mathblock .res{color:var(--good)} .mathblock .cmt{color:var(--mut)}
+  .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}
+  .kpi .b{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:12px}
+  .kpi .v{font:22px var(--mono);font-weight:700}
+  figure{margin:14px 0}figcaption{font-size:12px;color:var(--mut);margin-top:4px}
+  .tag-ib{color:var(--ib);font-weight:700}.tag-efa{color:var(--efa);font-weight:700}
+  .next{display:block;margin-top:24px;font-weight:700}
+</style>
+</head>
+<body>
+<header class="site">
+  <span class="brand">DeepEP-on-EFA Guidance</span>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">1·MoE</a>
+    <a href="02-efa-vs-infiniband.html">2·EFA vs IB</a>
+    <a href="03-scaling.html">3·Scaling</a>
+    <a href="04-microbenchmarks.html">4·Benchmarks</a>
+    <a href="05-alternatives.html">5·Alternatives</a>
+    <a href="06-solution-arch.html">6·Architecture</a>
+    <a href="07-the-math.html" style="color:var(--ink)">7·The Math</a>
+    <a href="../calculator/">▸ Calculator</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <h1>§7 · The Math — why MoE all-to-all behaves differently on EFA vs InfiniBand <span class="pill m">measured-calibrated</span></h1>
+  <p class="sub">A first-principles cost model for MoE expert-parallel all-to-all, derived from scratch and calibrated
+  to measured numbers. The thesis in one line: <b>DeepEP trades communication <i>bytes</i> for message <i>count</i>,
+  and on a fabric whose bottleneck is per-operation issue rate (EFA's CPU proxy), increasing message count is exactly
+  the wrong move.</b> Below we build the model, plug in measured constants, and produce the closed-form serving-throughput
+  gap between EFA and InfiniBand.</p>
+
+  <h2>7.1 · Notation + measured constants</h2>
+  <div class="kpi">
+    <div class="b"><div class="mut">tokens/rank/step (decode, conc=32)</div><div class="v">T ≈ 2</div></div>
+    <div class="b"><div class="mut">top-k experts/token</div><div class="v">k = 8</div></div>
+    <div class="b"><div class="mut">EP degree</div><div class="v">E = 16</div></div>
+    <div class="b"><div class="mut">cross-node fraction (2 nodes×8)</div><div class="v">½</div></div>
+    <div class="b"><div class="mut">EFA per-NIC effective</div><div class="v">25 GB/s</div></div>
+    <div class="b"><div class="mut">EFA node wire</div><div class="v">400 GB/s</div></div>
+    <div class="b"><div class="mut">measured node injection ceiling</div><div class="v">113 GB/s</div></div>
+    <div class="b"><div class="mut">measured dispatch NIC util</div><div class="v">2.2%</div></div>
+  </div>
+  <p class="legend">All constants <span class="pill m">measured</span> on 2× p5en.48xlarge EFA, Qwen3-30B-A3B-FP8 EP16
+  (per §4 microbenchmarks + <code>MEASURED-DATA.md</code>). The injection ceiling 113 GB/s (EXP-G40) proves the
+  <b>silicon is not the limit</b> — the wire can do 3.4× what DeepEP extracts; the limit is above it, in software.</p>
+
+  <h2>7.2 · How much does a MoE layer actually communicate?</h2>
+  <p>Each MoE layer does <b>two</b> all-to-alls per forward pass: <b>dispatch</b> (scatter tokens to their experts'
+  GPUs) and <b>combine</b> (gather results back). For T tokens/rank routed to k experts each, with experts sharded
+  across E ranks:</p>
+  <div class="mathblock">
+<span class="cmt"># messages a rank must ISSUE per dispatch (one per distinct destination rank it has tokens for)</span>
+<span class="lhs">msgs_dispatch</span> = min(T·k, E−1)          <span class="cmt"># bounded by #peers; at decode T·k is small → scatter to many peers</span>
+<span class="lhs">bytes_dispatch</span> = T·k·d_model·dtype     <span class="cmt"># the PAYLOAD — this is what DeepEP minimizes (O(top-k), not O(experts))</span>
+
+<span class="cmt"># DeepEP's advantage is on BYTES:</span>
+<span class="lhs">bytes(DeepEP)</span>   = T·k·hidden·1B(fp8)     <span class="res"># only the k chosen experts' tokens move</span>
+<span class="lhs">bytes(allgather)</span> ≈ T·E·hidden·1B          <span class="cmt"># every rank sees every token (E/k ≈ 2× more bytes at k=8,E=16)</span>
+  </div>
+  <p>So on <b>bytes</b>, DeepEP wins by ≈ E/k ≈ <b>2×</b> at this config (more at larger E). That is real — and it is
+  why DeepEP's transport microbench hits <b>33 GB/s SO vs UCCL-published 22.77</b> <span class="pill m">measured</span>.
+  But serving throughput is not set by bytes when the fabric is <b>issue-bound</b>. Next we show why.</p>
+
+  <h2>7.3 · The two rooflines: byte-bound vs issue-bound</h2>
+  <p>A transfer's time is the max of two limits — moving the bytes, and issuing the operations:</p>
+  <div class="mathblock">
+<span class="lhs">t_transfer</span> = max( <span class="cmt">bytes</span>/BW_wire , <span class="cmt">msgs</span>/R_issue )
+            └─ byte-bound ─┘   └─ issue-bound ─┘
+<span class="cmt"># BW_wire    = 400 GB/s/node (or 113 measured injection ceiling)</span>
+<span class="cmt"># R_issue    = ops/s the proxy can POST. One mutex-serialized CPU proxy thread.</span>
+  </div>
+  <figure>
+  <svg viewBox="0 0 760 300" role="img" aria-label="Roofline: byte-bound diagonal vs issue-bound ceiling; DeepEP decode sits deep in the issue-bound region at 2.2% wire utilization">
+    <rect x="0" y="0" width="760" height="300" fill="#0b0e15"/>
+    <!-- axes -->
+    <line x1="70" y1="250" x2="720" y2="250" stroke="#9aa4b8" stroke-width="1.5"/>
+    <line x1="70" y1="250" x2="70" y2="30" stroke="#9aa4b8" stroke-width="1.5"/>
+    <text x="395" y="285" fill="#9aa4b8" font-size="12" text-anchor="middle" font-family="monospace">message size (bytes/op) — log scale →</text>
+    <text x="22" y="140" fill="#9aa4b8" font-size="12" text-anchor="middle" transform="rotate(-90,22,140)" font-family="monospace">achieved GB/s</text>
+    <!-- wire ceiling -->
+    <line x1="70" y1="60" x2="720" y2="60" stroke="#46c98b" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="715" y="52" fill="#46c98b" font-size="11" text-anchor="end" font-family="monospace">400 GB/s wire ceiling</text>
+    <line x1="70" y1="95" x2="720" y2="95" stroke="#6ea8fe" stroke-width="2" stroke-dasharray="4 4"/>
+    <text x="715" y="88" fill="#6ea8fe" font-size="11" text-anchor="end" font-family="monospace">113 GB/s measured injection ceiling</text>
+    <!-- issue-bound diagonal (BW = msgsize * R_issue): small msgs => low achieved BW -->
+    <polyline points="70,245 200,200 340,150 470,110 600,95" fill="none" stroke="#ff8a5c" stroke-width="2.5"/>
+    <text x="610" y="100" fill="#ff8a5c" font-size="11" font-family="monospace">issue-bound: BW = msgsize × R_issue</text>
+    <!-- DeepEP decode operating point -->
+    <circle cx="150" cy="230" r="6" fill="#ef6f6f"/>
+    <text x="160" y="226" fill="#ef6f6f" font-size="11" font-family="monospace">DeepEP decode: ~128-tok msgs → 2.2% of wire</text>
+    <!-- DeepEP prefill point -->
+    <circle cx="360" cy="148" r="6" fill="#f0b357"/>
+    <text x="370" y="144" fill="#f0b357" font-size="11" font-family="monospace">DeepEP prefill: 4096-tok → 33 GB/s (8% wire)</text>
+    <text x="120" y="40" fill="#e8ecf4" font-size="12" font-family="monospace">MoE all-to-all lives on the LEFT (small messages) → issue-bound, not byte-bound</text>
+  </svg>
+  <figcaption>The roofline. MoE dispatch messages are small (especially at decode), so the operating point sits on the
+  steep issue-bound diagonal, far below the 400 GB/s wire ceiling — at a <b>measured 2.2% utilization</b>. Reducing
+  bytes (DeepEP's lever) slides you slightly left along a line you're already under; it does not raise R_issue. <span class="pill m">measured</span></figcaption>
+  </figure>
+
+  <h2>7.4 · The per-operation latency budget — where the time actually goes</h2>
+  <p>The serving-throughput difference is set by the <b>per-operation latency on the critical path</b>, not bandwidth.
+  Decompose one all-to-all op on each fabric:</p>
+  <div class="mathblock">
+<span class="tag-ib">InfiniBand + IBGDA</span> (GPU-initiated, kernel posts the WQE):
+  t = doorbell(~0.5µs) + RTT_ib(~2µs) ≈ <span class="res">~2.5µs, fully GPU-issued, OVERLAPPABLE with compute</span>
+
+<span class="tag-efa">EFA + CPU proxy</span> (today — GPU cannot post; host must):
+  t = D2H_ring_write + proxy_poll_latency + fi_writedata_build + libfabric + SRD_RTT + completion_poll
+    = a HOST ROUND-TRIP, per op, NOT hidden behind compute
+  measured aggregate effect on decode: <span class="res">+14.7 ms / token</span> vs the dense/allgather baseline
+  </div>
+  <figure>
+  <svg viewBox="0 0 760 230" role="img" aria-label="Stacked latency budget per decode token: IBGDA all-to-all hides under compute; EFA proxy adds 14.7ms on the critical path">
+    <rect x="0" y="0" width="760" height="230" fill="#0b0e15"/>
+    <text x="20" y="30" fill="#e8ecf4" font-size="13" font-family="monospace">per-decode-token latency budget (ms)</text>
+    <!-- scale: 0..55ms over x=180..720 -->
+    <!-- dense/allgather row -->
+    <text x="20" y="78" fill="#46c98b" font-size="12" font-family="monospace">dense/allgather</text>
+    <rect x="180" y="62" width="356" height="26" fill="#46c98b" opacity="0.85"/>
+    <text x="358" y="80" fill="#08101f" font-size="11" text-anchor="middle" font-family="monospace">compute + small a2a ≈ 36.3 ms → 27.6 tok/s</text>
+    <!-- DeepEP row -->
+    <text x="20" y="138" fill="#ff8a5c" font-size="12" font-family="monospace">DeepEP (EFA proxy)</text>
+    <rect x="180" y="122" width="356" height="26" fill="#46c98b" opacity="0.55"/>
+    <rect x="536" y="122" width="144" height="26" fill="#ef6f6f" opacity="0.9"/>
+    <text x="358" y="140" fill="#cfe8da" font-size="11" text-anchor="middle" font-family="monospace">same compute 36.3 ms</text>
+    <text x="608" y="140" fill="#fff" font-size="11" text-anchor="middle" font-family="monospace">+14.7 ms proxy tax</text>
+    <text x="688" y="138" fill="#ef6f6f" font-size="11" font-family="monospace">→ 19.6 tok/s</text>
+    <!-- axis ticks -->
+    <line x1="180" y1="165" x2="700" y2="165" stroke="#9aa4b8" stroke-width="1"/>
+    <text x="180" y="182" fill="#9aa4b8" font-size="10" font-family="monospace">0</text>
+    <text x="536" y="182" fill="#9aa4b8" font-size="10" font-family="monospace">36</text>
+    <text x="688" y="182" fill="#9aa4b8" font-size="10" font-family="monospace">51 ms</text>
+    <text x="20" y="212" fill="#9aa4b8" font-size="11" font-family="monospace">The compute is identical. The ONLY difference is the red proxy round-trip — and it is on the critical path, not hidden.</text>
+  </svg>
+  <figcaption>Decode latency budget. Both arms do the same expert compute (~36.3 ms/token aggregate). DeepEP adds a
+  fixed <b>+14.7 ms/token</b> CPU-proxy round-trip that IBGDA would hide. 1000/36.3 = 27.6 tok/s (dense);
+  1000/51.0 = 19.6 tok/s (DeepEP). <span class="pill d">derived</span> from <span class="pill m">measured</span> per-user rates.</figcaption>
+  </figure>
+
+  <h2>7.5 · Why the gap is a CONSTANT ratio — the proof it's a fixed cost</h2>
+  <p>If the proxy tax τ is a fixed per-step cost (independent of load), the throughput ratio is constant across
+  workloads. Measured per-user tok/s is flat — DeepEP 19.6 (σ=0.13), dense 27.6 (σ=0.51) — across conc4→32 and
+  ISL120→2048. That flatness <b>is</b> the proof:</p>
+  <div class="mathblock">
+<span class="lhs">ratio</span> = tok/s(DeepEP) / tok/s(dense)
+      = [1/(C+τ)] / [1/C]  =  C/(C+τ)
+  with C = 36.3 ms (compute), τ = 14.7 ms (proxy tax):
+<span class="lhs">ratio</span> = 36.3 / 51.0 = <span class="res">0.71</span>   <span class="cmt"># vs measured 0.65–0.72 across ALL regimes ✓</span>
+
+<span class="cmt"># a workload-dependent (bandwidth) effect would make this ratio MOVE with conc/ISL. It does not.</span>
+<span class="cmt"># constant ratio ⇔ fixed per-step latency cost ⇔ NOT a bandwidth problem.</span>
+  </div>
+  <figure>
+  <svg viewBox="0 0 760 250" role="img" aria-label="Per-user tok/s is flat across concurrency and ISL for both arms; the constant gap proves a fixed per-step cost">
+    <rect x="0" y="0" width="760" height="250" fill="#0b0e15"/>
+    <line x1="70" y1="210" x2="720" y2="210" stroke="#9aa4b8" stroke-width="1.5"/>
+    <line x1="70" y1="210" x2="70" y2="20" stroke="#9aa4b8" stroke-width="1.5"/>
+    <text x="395" y="240" fill="#9aa4b8" font-size="12" text-anchor="middle" font-family="monospace">workload:  conc4/ISL120 → conc32/ISL120 → conc16/ISL2048</text>
+    <text x="24" y="120" fill="#9aa4b8" font-size="12" text-anchor="middle" transform="rotate(-90,24,120)" font-family="monospace">per-user tok/s</text>
+    <!-- y scale 0..30 over y=210..40 ; x at 200,400,600 -->
+    <!-- dense flat ~27.6 -> y = 210-(27.6/30*170)=210-156=54 -->
+    <polyline points="200,54 400,57 600,53" fill="none" stroke="#46c98b" stroke-width="2.5"/>
+    <circle cx="200" cy="54" r="5" fill="#46c98b"/><circle cx="400" cy="57" r="5" fill="#46c98b"/><circle cx="600" cy="53" r="5" fill="#46c98b"/>
+    <text x="612" y="50" fill="#46c98b" font-size="11" font-family="monospace">dense 28.1 / 26.9 / 27.8</text>
+    <!-- deepep flat ~19.6 -> y = 210-(19.6/30*170)=210-111=99 -->
+    <polyline points="200,99 400,100 600,99" fill="none" stroke="#ff8a5c" stroke-width="2.5"/>
+    <circle cx="200" cy="99" r="5" fill="#ff8a5c"/><circle cx="400" cy="100" r="5" fill="#ff8a5c"/><circle cx="600" cy="99" r="5" fill="#ff8a5c"/>
+    <text x="612" y="95" fill="#ff8a5c" font-size="11" font-family="monospace">DeepEP 19.7 / 19.4 / 19.7</text>
+    <!-- the gap -->
+    <line x1="400" y1="57" x2="400" y2="100" stroke="#ef6f6f" stroke-width="1.5" stroke-dasharray="3 2"/>
+    <text x="408" y="82" fill="#ef6f6f" font-size="11" font-family="monospace">constant gap = the fixed τ</text>
+  </svg>
+  <figcaption>Two flat lines. The gap between them does not narrow as load grows — that constancy (σ ≈ 0.1–0.5 tok/s)
+  is the empirical signature of a <b>fixed per-step cost</b>, not a bandwidth effect a bigger batch could amortize. <span class="pill m">measured</span></figcaption>
+  </figure>
+
+  <h2>7.6 · The closed-form EFA-vs-InfiniBand serving gap</h2>
+  <p>On InfiniBand + IBGDA the all-to-all is GPU-issued and overlaps compute, so τ_ib ≈ 0 on the critical path.
+  On EFA the proxy tax τ_efa is exposed. The serving-throughput gap between the two fabrics, for the <i>same</i> DeepEP
+  algorithm, is:</p>
+  <div class="mathblock">
+<span class="lhs">speedup(IB / EFA)</span> = tok/s_ib / tok/s_efa = (C + τ_efa) / (C + τ_ib) ≈ (C + τ_efa) / C
+                  = (36.3 + 14.7) / 36.3 = <span class="res">1.40×</span>   <span class="cmt"># IB would serve DeepEP ~1.4× faster than EFA does</span>
+
+<span class="cmt"># and vs the EFA dense baseline, DeepEP-on-EFA is 0.71× — i.e. on EFA the all-to-all OPTIMIZATION is a PESSIMIZATION,</span>
+<span class="cmt"># because the fabric makes you pay for messages, and DeepEP issues MORE (smaller) of them than allgather.</span>
+  </div>
+  <div class="warnbox">The decisive asymmetry: <b>InfiniBand rewards reducing bytes</b> (it has GPU-initiated posting,
+  so message overhead is cheap and bandwidth is the budget). <b>EFA today rewards reducing message count</b> (the
+  host-proxy makes each op expensive, so issue rate is the budget). DeepEP optimizes the first and aggravates the
+  second. <b>Same code, opposite verdict — set entirely by whether the NIC can be driven from the GPU kernel.</b></div>
+
+  <h2>7.7 · What would change the math (the improvement path)</h2>
+  <p>The model says the lever is τ (the per-op proxy tax), not bytes. Two ways to attack τ:</p>
+  <div class="mathblock">
+1. <span class="tag-efa">GPU-initiated transport on EFA (GDAKI)</span> — kernel posts the WQE, τ → ~one doorbell+RTT.
+   Status: cross-node BARRIER works (19µs <span class="pill m">measured</span>); DISPATCH blocked on rdma-core #1701
+   (the gap shrank from 3 unshipped layers to 1 — libfabric #12114 + aws-ofi-nccl GDAKI now upstream). Would
+   collapse τ and FLIP the verdict — this is the InfiniBand-parity path.
+2. <span class="tag-efa">Cut proxy ops per token (software, today)</span> — eager-sends for grouped receives
+   (aws-ofi-nccl #1194/#1211, merged, NEVER TESTED) + multi-comm K threads (EP_NUM_COMMS=8, ships 4.3× transport
+   BW but doesn't yet convert to tok/s). These lower the constant in front of τ; they don't remove the host round-trip.
+  </div>
+  <p class="legend">The honest ceiling: software levers (#2) can raise R_issue and shave τ but cannot make a host
+  round-trip free. Only GPU-initiated posting (#1) removes it. Until rdma-core #1701 ships, EFA's MoE-serving verdict
+  stays "dense/allgather ≥ DeepEP." <span class="pill m">measured</span> + <span class="pill d">model</span>.</p>
+
+  <a class="next" href="../index.html">← back to Overview</a> ·
+  <a class="next" href="../calculator/" style="display:inline">try the Calculator ▸</a>
+
+  <div class="foot">All constants measured on 2× p5en.48xlarge AWS EFA, Qwen3-30B-A3B-FP8 EP16, AIPerf 0.10.0.
+  Model derivations tagged <span class="pill d">derived</span>/<span class="pill d">model</span>; inputs
+  <span class="pill m">measured</span>. Sanitized — no internal IPs, registry IDs, or hostnames.</div>
+</div>
+</body>
+</html>

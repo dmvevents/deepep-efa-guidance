@@ -1,5 +1,7 @@
 # DeepEP-on-EFA Guidance Site
 
+**LIVE:** https://dmvevents.github.io/deepep-efa-guidance/ (public repo dmvevents/deepep-efa-guidance)
+
 Self-contained static site (no build step) — measured guidance on whether to use DeepEP
 MoE expert-parallel all-to-all, or a dense/allgather alternative, on AWS EFA.
 
