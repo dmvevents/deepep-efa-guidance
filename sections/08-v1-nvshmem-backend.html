@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§8 · DeepEP V1 (NVSHMEM backend) on EFA — H200 A/B + the LL fix</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .kpi{background:var(--panel2,#161616);border:1px solid var(--line,#2a2a2a);border-radius:9px;padding:13px 14px}
+  .kpi .n{font:22px/1.1 var(--mono);font-weight:700}
+  .kpi .l{font-size:11px;color:var(--mut);margin-top:5px;text-transform:uppercase;letter-spacing:.4px}
+  .src{font:11px var(--mono);color:var(--mut)}
+  .num{font:12px var(--mono)}
+  .ratio-tie{color:var(--warn);font-weight:700}
+  .ratio-lose{color:var(--bad);font-weight:700}
+  .ratio-win{color:var(--good);font-weight:700}
+  caption{caption-side:top;text-align:left;color:var(--mut);font-size:12px;padding:4px 0}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <span class="brand">DeepEP on EFA</span>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">01 · What is DeepEP</a>
+    <a href="02-efa-vs-infiniband.html">02 · IB vs EFA</a>
+    <a href="03-scaling.html">03 · Drop-in</a>
+    <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+    <a href="05-alternatives.html">05 · Alternatives</a>
+    <a href="06-solution-arch.html">06 · Recipe</a>
+    <a href="07-the-math.html">07 · The Math</a>
+    <a href="08-v1-nvshmem-backend.html" style="color:var(--ink)">08 · V1 (NVSHMEM)</a>
+    <a href="../calculator/">Calculator</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <h1>§8 · DeepEP <b>V1</b> — the NVSHMEM backend on EFA <span class="pill m">measured</span></h1>
+  <p class="sub">The rest of this guide covers DeepEP-<b>V2</b> (the NCCL-GIN / <code>ElasticBuffer</code> path).
+  This section covers the <b>other</b> DeepEP backend — <b>V1, the legacy NVSHMEM backend</b>
+  (<code>deep_ep.Buffer</code>, <code>low_latency_dispatch</code>), built on source-compiled NVSHMEM linked
+  against EFA's libfabric. It is what vLLM drives via <code>--all2all-backend deepep_high_throughput</code> /
+  <code>deepep_low_latency</code>. We ran a fresh head-to-head on <b>p5en / H200 / 16 EFA NICs</b>: our
+  NVSHMEM <b>3.6.5</b> fork vs the AWS <b>3.7.0</b> build.</p>
+
+  <h2>V1 vs V2 — two different DeepEP backends</h2>
+  <table>
+    <thead><tr><th></th><th>V1 — NVSHMEM backend (this section)</th><th>V2 — NCCL-GIN backend (rest of site)</th></tr></thead>
+    <tbody>
+      <tr><td>Python object</td><td class="num">deep_ep.Buffer / low_latency_dispatch</td><td class="num">deep_ep.ElasticBuffer</td></tr>
+      <tr><td>Transport</td><td>NVSHMEM → CPU proxy → libfabric/EFA</td><td>NCCL-GIN type-2 CPU proxy → EFA</td></tr>
+      <tr><td>vLLM flag</td><td class="num">--all2all-backend deepep_high_throughput | deepep_low_latency</td><td class="num">--all2all-backend deepep_v2</td></tr>
+      <tr><td>Needs on EFA</td><td>source-built NVSHMEM vs EFA libfabric + the EFA shim (no IBGDA)</td><td>aws-ofi-nccl GIN plugin + ElasticBuffer</td></tr>
+      <tr><td>DeepEP commit class</td><td class="num">567632d (pre-EPv2)</td><td>EPv2 (restructured kernels)</td></tr>
+    </tbody>
+  </table>
+  <p class="src">Both are CPU-proxy paths on EFA. Neither uses GPU-initiated RDMA — EFA exposes no IBGDA. The
+  "proxy tax" §2 describes applies to V1 too.</p>
+
+  <h2>The headline: ours vs AWS on H200 (same nodes, same DeepEP tuner)</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="n ratio-lose">1.9×</div><div class="l">AWS faster — prefill BF16 dispatch (71.6 vs our 37.0 GB/s RDMA)</div></div>
+    <div class="kpi"><div class="n ratio-lose">2.1×</div><div class="l">AWS faster — prefill combine (63.5 vs 30.6 GB/s)</div></div>
+    <div class="kpi"><div class="n ratio-tie">≈ tie</div><div class="l">intranode NVLink (320/330/321 GB/s both) — transport-agnostic</div></div>
+    <div class="kpi"><div class="n">0.67 ms</div><div class="l">our decode LL dispatch on H200 (after the env fix below)</div></div>
+  </div>
+  <table>
+    <caption>Internode prefill 4096-tok, BF16, per-bottleneck RDMA GB/s · 2 reps each · p5en/H200/16-NIC</caption>
+    <thead><tr><th>metric</th><th>A — ours (NVSHMEM 3.6.5 + SWAP)</th><th>B — AWS (NVSHMEM 3.7.0 + patch)</th><th>winner</th></tr></thead>
+    <tbody>
+      <tr><td>dispatch</td><td class="num">37.0 / 37.0</td><td class="num">71.6 / 71.7</td><td class="ratio-lose">B 1.94×</td></tr>
+      <tr><td>combine</td><td class="num">30.6 / 30.7</td><td class="num">63.1 / 63.5</td><td class="ratio-lose">B 2.08×</td></tr>
+      <tr><td>FP8 dispatch</td><td class="num">29.0</td><td class="num">62.6</td><td class="ratio-lose">B 2.13×</td></tr>
+      <tr><td>correctness</td><td class="num">24/24</td><td class="num">64/64</td><td class="ratio-tie">tie</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Why AWS V1 is ~2× faster (same architecture, NOT IBGDA)</h2>
+  <div class="panel">
+    <p>Both stacks are CPU-proxy + libfabric. AWS pulls ahead purely on <b>host-transport efficiency it gets
+    from NVSHMEM 3.7.0</b>:</p>
+    <ul>
+      <li><b>Reverse-path ack-aggregation</b> (the biggest lever) — 3.6.5 sends <b>one software ack per
+      message</b>; 3.7.0 sends <b>one aggregated ack per peer per progress cycle</b>, freeing the single CPU
+      proxy thread from an ack storm. We lack it entirely.</li>
+      <li><b>Forward-path put+signal fusion</b> — AWS fuses the per-token data write + remote tail update into
+      one RDMA-write-with-immediate; we issue a separate put + a 2-sided <code>fi_send</code> atomic.</li>
+    </ul>
+    <p>Our SWAP-004/007/009/017/018 patches are partial hand-ports of work NVSHMEM 3.7.0 ships natively and
+    more completely. <b>The fix is to rebase off 3.6.5 onto 3.7.0 + adopt the AWS <code>deepep_aws_efa.patch</code></b>,
+    not to keep patching 3.6.5.</p>
+  </div>
+
+  <h2>Decode / low-latency on H200 — the handle-cache bug + the fix</h2>
+  <p>vLLM's <code>deepep_low_latency</code> backend calls <code>Buffer.low_latency_dispatch/combine</code>. On
+  our NVSHMEM 3.6.5 build this <b>segfaulted on H200</b> (<span class="num">signal 11 @ 0x28</span>). Root
+  cause (verified at source + runtime, <b>not</b> an SRD-ordering or NIC-count issue — reproduced at
+  <code>NIC_PER_PE=1</code>):</p>
+  <div class="warnbox">
+    <b>NVSHMEM 3.6.5 symmetric-heap handle-cache bug.</b> For the large (1.88 GB) LL buffer, the proxy's
+    <code>get_transport_mem_handle</code> returns a NULL/garbage <i>remote</i> handle at high offset →
+    NULL flows into <code>fi_write</code> (<code>nvshmemt_libfabric_rma_impl</code>); the <code>NDEBUG</code>
+    build compiled out the guarding assert. <b>Size-gated, not H200-gated.</b>
+  </div>
+  <table>
+    <thead><tr><th>path</th><th>3.6.5 fix attempt</th><th>result</th></tr></thead>
+    <tbody>
+      <tr><td>LL dispatch</td><td class="num">NVSHMEM_ENABLE_RAIL_OPT=1</td><td class="ratio-win">WORKS — 0.66/0.67/0.72 ms, PASS (first ever our-LL on H200)</td></tr>
+      <tr><td>LL combine</td><td class="num">RAIL_OPT + CUMEM_GRANULARITY=2GB</td><td class="ratio-lose">still segv (offset ~939 MB) — needs the real fix</td></tr>
+      <tr><td>both</td><td class="num">rebase to NVSHMEM 3.7.0</td><td class="ratio-win">fixed upstream — see below</td></tr>
+    </tbody>
+  </table>
+  <p>The <b>real fix is NVSHMEM 3.7.0</b>: its changelog explicitly closes this — <i>"Fixed a bug in remote
+  transports during memory registration … memory handle management cache"</i> + a <code>NVSHMEM_CUMEM_GRANULARITY</code>
+  static-heap override. The AWS V1 build already runs full LL D+C on H200 (~0.82 ms) because its patch deletes
+  the device-side rkey cache, so all handle resolution happens CPU-side in 3.7.0's fixed transport — the device
+  never executes the buggy <code>offset &gt;&gt; log2_granularity</code>.</p>
+
+  <h2>How vLLM consumes V1 (the inference mapping)</h2>
+  <table>
+    <thead><tr><th>vLLM all2all backend</th><th>DeepEP V1 call</th><th>regime</th><th>EFA status</th></tr></thead>
+    <tbody>
+      <tr><td class="num">deepep_high_throughput</td><td class="num">Buffer.dispatch / combine</td><td>prefill</td><td class="ratio-win">works on both 3.6.5 &amp; 3.7.0</td></tr>
+      <tr><td class="num">deepep_low_latency</td><td class="num">Buffer.low_latency_dispatch / combine</td><td>decode</td><td class="ratio-tie">3.7.0 only (3.6.5 combine segv)</td></tr>
+    </tbody>
+  </table>
+  <p class="src">Verified in vLLM <code>distributed/device_communicators/all2all.py</code>:
+  <code>DeepEPHTAll2AllManager → deep_ep.Buffer(...)</code>; <code>DeepEPLLAll2AllManager →
+  Buffer.get_low_latency_rdma_size_hint + low_latency_dispatch</code>.</p>
+
+  <h2>The verdict for V1</h2>
+  <div class="twocol">
+    <div class="is"><b>V1 on EFA — what's true</b>
+      <ul>
+        <li>Runs on EFA via source-built NVSHMEM + the EFA shim (no IBGDA).</li>
+        <li><b>Use NVSHMEM ≥ 3.7.0 + the AWS patch</b> — it's ~2× our 3.6.5 fork on prefill and is the only V1
+        build that completes decode LL on H200.</li>
+        <li>vLLM/SGLang drive it directly via <code>deepep_high_throughput</code> / <code>deepep_low_latency</code>.</li>
+      </ul>
+    </div>
+    <div class="isnot"><b>V1 on EFA — caveats</b>
+      <ul>
+        <li>Same CPU-proxy "proxy tax" as V2 (§2) — the serving-throughput conclusions of this guide still apply.</li>
+        <li>Our hand-patched 3.6.5 fork is superseded; don't build new work on it.</li>
+        <li>A serving <i>speedup</i> over dense still needs GPU-initiated transport (GDAKI/IBGDA), absent on EFA.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot">
+    V1 A/B from the nvshmem-efa campaign (2026-06-24/25). Hardware: 2× p5en.48xlarge, H200, 16 EFA NICs.
+    Stacks: ours NVSHMEM 3.6.5-0 + SWAP + direct-signal-v1 vs AWS NVSHMEM 3.7.0 + <code>deepep_aws_efa.patch</code>
+    (DeepEP 567632d). Reproducible repo + raw logs: <code>github.com/dmvevents/deepep-efa-ab-h200</code>.
+    Sanitized — no internal IPs, registry IDs, or hostnames.
+  </div>
+</div>
+</body>
+</html>
