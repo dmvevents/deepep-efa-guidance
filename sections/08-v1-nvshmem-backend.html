@@ -118,12 +118,48 @@
   the device-side rkey cache, so all handle resolution happens CPU-side in 3.7.0's fixed transport — the device
   never executes the buggy <code>offset &gt;&gt; log2_granularity</code>.</p>
 
+  <h2>The capstone: does V1 actually <i>serve</i> faster? (vLLM EP16, H200, measured)</h2>
+  <p>The microbench above says AWS V1 moves dispatch bytes ~2× faster. <b>The real question is whether that
+  converts to serving throughput.</b> We built a single NGC-from-scratch image (NVSHMEM 3.7.0 + DeepEP
+  <code>567632d</code> + the EFA shim + vLLM from source) and served <b>Qwen3-30B-A3B-FP8 with Expert
+  Parallelism (EP16, DP16×TP1)</b> across 2× p5en/H200, driving <b>both</b> DeepEP-V1 backends. Repro =
+  one Dockerfile + one <code>serve.yaml</code> + one <code>run_test.sh</code>:
+  <code>github.com/dmvevents/deepep-efa-ab-h200/tree/master/capstone</code>.</p>
+  <div class="kpis">
+    <div class="kpi"><div class="n ratio-lose">~75 ms</div><div class="l">HT per-user TPOT — PINNED across all 4 regimes (prefill/decode × conc4/conc32)</div></div>
+    <div class="kpi"><div class="n ratio-lose">+29–75%</div><div class="l">deepep_low_latency is WORSE TPOT than high_throughput — in every regime</div></div>
+    <div class="kpi"><div class="n ratio-win">✓ runs</div><div class="l">decode LL completes on 3.7.0 (segfaulted on our 3.6.5)</div></div>
+    <div class="kpi"><div class="n">7.7×</div><div class="l">decode tok/s scales w/ concurrency (55→425) — but TPOT stays flat</div></div>
+  </div>
+  <table>
+    <caption>vLLM v0.11.0, enforce-eager, EP16, n=64 (conc4) / 256 (conc32) per cell · median TPOT (ms) / output tok/s</caption>
+    <thead><tr><th>regime</th><th>HT TPOT</th><th>LL TPOT</th><th>LL vs HT</th><th>HT tok/s</th><th>LL tok/s</th></tr></thead>
+    <tbody>
+      <tr><td>prefill conc4</td><td class="num">73.5</td><td class="num">98.4</td><td class="ratio-lose">+34% worse</td><td class="num">53.0</td><td class="num">37.0</td></tr>
+      <tr><td>prefill conc32</td><td class="num">77.0</td><td class="num">134.8</td><td class="ratio-lose">+75% worse</td><td class="num">386.8</td><td class="num">190.8</td></tr>
+      <tr><td>decode conc4</td><td class="num">72.7</td><td class="num">93.8</td><td class="ratio-lose">+29% worse</td><td class="num">55.0</td><td class="num">42.6</td></tr>
+      <tr><td>decode conc32</td><td class="num">75.2</td><td class="num">98.2</td><td class="ratio-lose">+31% worse</td><td class="num">424.9</td><td class="num">324.9</td></tr>
+    </tbody>
+  </table>
+  <div class="panel">
+    <p><b>The 2× microbench win does NOT convert to serving.</b> HT per-user TPOT is pinned at <b>~73–77 ms
+    across every regime</b> (p99 within 1 ms of p50 in decode). Aggregate throughput scales with concurrency,
+    but per-token latency is a hard floor — the <b>fixed CPU-proxy all-to-all round-trip</b> (§2's proxy tax).
+    A faster dispatch microbench moves bytes faster; it does not remove the per-token host hop.</p>
+    <p><b>"Low-latency" is not low-latency on EFA.</b> <code>deepep_low_latency</code> is <b>29–75% worse TPOT
+    than <code>deepep_high_throughput</code> in every regime</b>, including its design home (small-batch
+    decode: 93.8 vs 72.7 ms). On EFA's CPU-proxy path its smaller-message / put+signal optimizations are
+    swamped by — and add overhead to — the per-token host round-trip. <b>Use <code>deepep_high_throughput</code>.</b>
+    This reproduces the V2 capstone's verdict (0.65–0.97× dense): a serving <i>speedup</i> needs GPU-initiated
+    transport (GDAKI/IBGDA), which EFA does not expose.</p>
+  </div>
+
   <h2>How vLLM consumes V1 (the inference mapping)</h2>
   <table>
     <thead><tr><th>vLLM all2all backend</th><th>DeepEP V1 call</th><th>regime</th><th>EFA status</th></tr></thead>
     <tbody>
-      <tr><td class="num">deepep_high_throughput</td><td class="num">Buffer.dispatch / combine</td><td>prefill</td><td class="ratio-win">works on both 3.6.5 &amp; 3.7.0</td></tr>
-      <tr><td class="num">deepep_low_latency</td><td class="num">Buffer.low_latency_dispatch / combine</td><td>decode</td><td class="ratio-tie">3.7.0 only (3.6.5 combine segv)</td></tr>
+      <tr><td class="num">deepep_high_throughput</td><td class="num">Buffer.dispatch / combine</td><td>prefill &amp; decode</td><td class="ratio-win">works on 3.6.5 &amp; 3.7.0 — BEST TPOT on EFA, use this</td></tr>
+      <tr><td class="num">deepep_low_latency</td><td class="num">Buffer.low_latency_dispatch / combine</td><td>decode</td><td class="ratio-lose">3.7.0 only; 29–75% worse TPOT than HT on EFA</td></tr>
     </tbody>
   </table>
   <p class="src">Verified in vLLM <code>distributed/device_communicators/all2all.py</code>:
@@ -152,7 +188,9 @@
   <div class="foot">
     V1 A/B from the nvshmem-efa campaign (2026-06-24/25). Hardware: 2× p5en.48xlarge, H200, 16 EFA NICs.
     Stacks: ours NVSHMEM 3.6.5-0 + SWAP + direct-signal-v1 vs AWS NVSHMEM 3.7.0 + <code>deepep_aws_efa.patch</code>
-    (DeepEP 567632d). Reproducible repo + raw logs: <code>github.com/dmvevents/deepep-efa-ab-h200</code>.
+    (DeepEP 567632d). Capstone serving = vLLM v0.11.0 EP16, Qwen3-30B-A3B-FP8, enforce-eager.
+    Reproducible repo + raw logs + the 3-file serving recipe (Dockerfile / serve.yaml / run_test.sh):
+    <code>github.com/dmvevents/deepep-efa-ab-h200</code> (see <code>capstone/</code>).
     Sanitized — no internal IPs, registry IDs, or hostnames.
   </div>
 </div>

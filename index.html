@@ -61,7 +61,7 @@
     <div class="card"><b>§4 · Microbenchmarks</b><div class="mut">Transport GB/s + real AIPerf inference numbers, sourced. <a href="sections/04-microbenchmarks.html">open →</a></div></div>
     <div class="card"><b>§5 · Alternatives</b><div class="mut">dense, UCCL, pplx, IBGDA — do they serve, how fast. <a href="sections/05-alternatives.html">open →</a></div></div>
     <div class="card"><b>§6 · Solution architecture</b><div class="mut">What works today + internal/customer decision trees. <a href="sections/06-solution-arch.html">open →</a></div></div>
-    <div class="card"><b>§8 · DeepEP V1 (NVSHMEM backend)</b><div class="mut">The <i>other</i> DeepEP backend — <code>deep_ep.Buffer</code> / NVSHMEM-on-EFA. Fresh H200 A/B: ours vs AWS (~2× gap), the decode LL handle-cache bug + the 3.7.0 fix, and how vLLM drives it. <a href="sections/08-v1-nvshmem-backend.html">open →</a></div></div>
+    <div class="card"><b>§8 · DeepEP V1 (NVSHMEM backend)</b><div class="mut">The <i>other</i> DeepEP backend — <code>deep_ep.Buffer</code> / NVSHMEM-on-EFA. H200 A/B (ours vs AWS, ~2× gap), the decode LL handle-cache bug + 3.7.0 fix, and the <b>vLLM EP16 serving capstone</b>: the 2× microbench win does <i>not</i> convert (TPOT pinned ~75ms), and "low-latency" is worse than high-throughput. <a href="sections/08-v1-nvshmem-backend.html">open →</a></div></div>
   </div>
 
   <h2>Try it on your config</h2>
