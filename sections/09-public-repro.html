@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§9 · Reproduce it all from public roots — six gates, one repo (+ the 2× multicomm lever)</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .kpi{background:var(--panel2,#161616);border:1px solid var(--line,#2a2a2a);border-radius:9px;padding:13px 14px}
+  .kpi .n{font:22px/1.1 var(--mono);font-weight:700}
+  .kpi .l{font-size:11px;color:var(--mut);margin-top:5px;text-transform:uppercase;letter-spacing:.4px}
+  .src{font:11px var(--mono);color:var(--mut)}
+  .num{font:12px var(--mono)}
+  .ratio-tie{color:var(--warn);font-weight:700}
+  .ratio-lose{color:var(--bad);font-weight:700}
+  .ratio-win{color:var(--good);font-weight:700}
+  caption{caption-side:top;text-align:left;color:var(--mut);font-size:12px;padding:4px 0}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <span class="brand">DeepEP on EFA</span>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">01 · What is DeepEP</a>
+    <a href="02-efa-vs-infiniband.html">02 · IB vs EFA</a>
+    <a href="03-scaling.html">03 · Drop-in</a>
+    <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+    <a href="05-alternatives.html">05 · Alternatives</a>
+    <a href="06-solution-arch.html">06 · Recipe</a>
+    <a href="07-the-math.html">07 · The Math</a>
+    <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
+    <a href="09-public-repro.html" style="color:var(--ink)">09 · Reproduce it</a>
+    <a href="../calculator/">Calculator</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <h1>§9 · Reproduce everything from PUBLIC roots — six gates, one repo <span class="pill m">measured</span></h1>
+  <p class="sub">Everything this guide claims about DeepEP-<b>V2</b> on EFA is now reproducible by anyone with
+  2× p5en and public internet: official NGC bases, <code>deepseek-ai/DeepEP</code>, PyPI wheels, <code>aws/aws-ofi-nccl</code>,
+  and a set of committed patch files. No private image, fork, or registry anywhere in the chain. The July 2026
+  re-run also produced <b>one new headline</b> the June campaign only had on a fork build: the
+  <b class="good">multicomm lever doubles vLLM throughput</b> on the pure public stack.</p>
+
+  <div class="panel">
+    <p><b>The repo:</b> <a href="https://github.com/antonai-work/deepep-v2-efa-repro"><code>github.com/antonai-work/deepep-v2-efa-repro</code></a>
+    — GUIDE (what to run, in order), README (full recipe + pins), RESULTS (every number on one page),
+    <code>patches/</code> (each verified apply-clean on its public root), <code>bench/</code> + <code>training/</code>
+    + <code>trtllm/</code> + <code>llmd/</code> lanes, and <code>results/</code> with the as-run AIPerf exports and
+    serve-log evidence behind every row below.</p>
+  </div>
+
+  <h2>The six gates (all PASS, 2026-07-06/07 re-run)</h2>
+  <table>
+    <caption>2× p5en.48xlarge (H200, 16 EFA NICs/node), Qwen3-30B-A3B-FP8, EP16 · AIPerf 0.10.0 ISL120/OSL128 conc 4/8/32</caption>
+    <thead><tr><th>#</th><th>gate</th><th>what it proves</th><th>measured</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>micro D+C (test_ep, cross-node)</td><td>the transport itself</td><td class="num"><b class="good">443.6 µs</b> p50 (contract ≤740; dispatch 185.4 + combine 258.2)</td></tr>
+      <tr><td>2</td><td>vLLM 0.24.0 + AIPerf</td><td>unmodified PyPI wheel serves MoE</td><td class="num">c32 <b>144.6</b> agg tok/s · 0 err (first PyPI release with <code>DeepEPV2All2AllManager</code>)</td></tr>
+      <tr><td>3</td><td>SGLang 0.5.11 + seam patch + AIPerf</td><td>second engine (PR #24443 lineage)</td><td class="num">c32 <b>255.2</b> · 0 err (1.01× the June campaign baseline)</td></tr>
+      <tr><td>4</td><td>TRT-LLM 0.21.0 + <b>native seam</b> + AIPerf</td><td>third engine, no shim (one-file patch)</td><td class="num">c32 <b>563–587</b> · 0 err · <code>AlltoallMethodType.DeepEP</code> asserted</td></tr>
+      <tr><td>5</td><td>Megatron-LM train step</td><td>training path (= open PR #4632)</td><td class="num">loss 26.41→24.61 · grad_norm finite · EFA TX 1.096 GB</td></tr>
+      <tr><td>6</td><td>NeMo-RL rollout</td><td>RL rollout (transitive via Megatron)</td><td class="num">rollout PASS 9.45 s world=16 · loss 26.41→24.59</td></tr>
+    </tbody>
+  </table>
+  <p class="src">Every serve is backend-asserted in-log: ElasticBuffer ctor ×16 + "Selected provider is efa,
+  fabric is efa-direct" ×16 (pods expose no hw_counters sysfs; provider-line substitute recorded). llm-d has no
+  gate by design — it is a router, not a DeepEP consumer (its EFA story is NIXL KV-transfer); its routing lane is
+  validated separately in the repo.</p>
+
+  <h2>NEW measured result: EP_NUM_COMMS=8 doubles vLLM on the public stack</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="n ratio-win">2.02×</div><div class="l">agg tok/s at conc4 (19.5 → 39.4)</div></div>
+    <div class="kpi"><div class="n ratio-win">1.89×</div><div class="l">agg at conc32 (144.6 → 273.0)</div></div>
+    <div class="kpi"><div class="n ratio-win">½ ITL</div><div class="l">203 → 100 ms/token p50</div></div>
+    <div class="kpi"><div class="n">0 err</div><div class="l">232/232 requests, 3 cells</div></div>
+  </div>
+  <table>
+    <caption>vLLM 0.24.0 EP16, identical serve except EP_NUM_COMMS · measured 2026-07-07</caption>
+    <thead><tr><th>arm</th><th>c4</th><th>c8</th><th>c32</th><th>per-user c4</th><th>TTFT p50 c4</th><th>ITL p50</th></tr></thead>
+    <tbody>
+      <tr><td class="num">EPNC=1 (pure public)</td><td class="num">19.5</td><td class="num">38.8</td><td class="num">144.6</td><td class="num">4.9</td><td class="num">475 ms</td><td class="num">~203 ms</td></tr>
+      <tr><td class="num"><b>EPNC=8 (multicomm patch)</b></td><td class="num"><b>39.4</b></td><td class="num"><b>76.5</b></td><td class="num"><b>273.0</b></td><td class="num"><b>10.0</b></td><td class="num"><b>196 ms</b></td><td class="num"><b>~100 ms</b></td></tr>
+    </tbody>
+  </table>
+  <p>Why it works: the CPU-proxy path is <b>issue-bound</b> (§2's proxy tax — the NIC sits ~98% idle). Striping
+  the all-to-all over <b>K independent NCCL comms</b> (<code>EP_NUM_COMMS=8</code>) multiplies the in-flight issue
+  streams, attacking the actual bottleneck instead of the wire. This is the first lever in this guide that
+  <i>converts</i> to serving throughput on EFA — it doubles vLLM but does <b>not</b> change the §6 verdict:
+  273 tok/s still sits near SGLang's 255 and below TRT's dense arm; the ceiling is still the proxy, now at
+  half the tax. The lever is one committed patch (<code>deepep-multicomm-overlay.patch</code>) + a
+  <code>_C</code> rebuild + one env var — inert when <code>EP_NUM_COMMS</code> is unset/1.</p>
+
+  <h2>The cross-framework serving table (same workload, each framework's proven config)</h2>
+  <table>
+    <caption>agg output tok/s · AIPerf ISL120/OSL128 · all cells 0 errors · not a single-variable A/B (engines differ)</caption>
+    <thead><tr><th>arm</th><th>c4</th><th>c8</th><th>c32</th><th>per-user</th><th>ITL p50</th></tr></thead>
+    <tbody>
+      <tr><td class="num">vLLM EPNC=1</td><td class="num">19.5</td><td class="num">38.8</td><td class="num">144.6</td><td class="num">~4.9</td><td class="num">203 ms</td></tr>
+      <tr><td class="num">vLLM EPNC=8</td><td class="num">39.4</td><td class="num">76.5</td><td class="num">273.0</td><td class="num">~9.9</td><td class="num">100 ms</td></tr>
+      <tr><td class="num">SGLang 0.5.11</td><td class="num">34.5</td><td class="num">67.2</td><td class="num">255.2</td><td class="num">~8.6</td><td class="num">117 ms</td></tr>
+      <tr><td class="num">TRT-LLM shim</td><td class="num">66.5</td><td class="num">147.5</td><td class="num">586.7</td><td class="num">~19.3</td><td class="num">52 ms</td></tr>
+      <tr><td class="num">TRT-LLM <b>native seam</b></td><td class="num">67.6</td><td class="num">142.4</td><td class="num">563.3</td><td class="num">~18.6</td><td class="num">53 ms</td></tr>
+    </tbody>
+  </table>
+  <p class="src">TRT-LLM remains the fastest engine on this workload AND still loses to its own dense arm
+  (~106 agg at c4) — §6's verdict stands. Native seam ≡ shim within run noise (−4% at c32): the clean
+  integration costs nothing.</p>
+
+  <h2>What changed since the June campaign (§4–§6 context)</h2>
+  <table>
+    <thead><tr><th>claim as of June 2026</th><th>status July 2026</th></tr></thead>
+    <tbody>
+      <tr><td>vLLM DeepEP-V2 needs a fork (<code>tlrmchlsmth/vllm</code>)</td><td class="ratio-win">CLOSED — PyPI <code>vllm==0.24.0</code> carries the manager natively (PR #41183 merged)</td></tr>
+      <tr><td>TRT-LLM serves DeepEP only via a private 1,500-line sitecustomize shim</td><td class="ratio-win">CLOSED — one-file public seam patch on <code>deep_ep_utils.py</code>; shim retired (kept as legacy); upstream PR drafted</td></tr>
+      <tr><td>multicomm 2.09× measured only on the fork build</td><td class="ratio-win">REPRODUCED on the pure public stack: 1.89–2.02×</td></tr>
+      <tr><td>Megatron/NeMo-RL patches private</td><td class="ratio-win">PUBLIC — Megatron seam = open PR #4632 (head fetchable via <code>pull/4632/head</code>); NeMo-RL env fix MERGED (#2585)</td></tr>
+      <tr><td>DeepEP QP-cap trio (PR #612)</td><td class="ratio-tie">still OPEN upstream; committed as patches, apply-clean on <code>b306af06</code></td></tr>
+      <tr><td>SGLang ElasticBuffer support (PR #24443)</td><td class="ratio-tie">still OPEN upstream; seam patch committed, apply-clean on the 0.5.11 wheel</td></tr>
+      <tr><td>serving verdict: DeepEP ≤ dense on EFA</td><td class="ratio-tie">UNCHANGED — capacity/fit + prefill regimes remain the use case; EPNC=8 halves the gap but does not flip it</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The gotchas that cost the most hours (so you don't pay them)</h2>
+  <div class="twocol">
+    <div class="is"><b>Serving</b>
+      <ul>
+        <li>"Gin barrier timeout tag:N" is a <b>symptom</b> — one rank died elsewhere (import error, JIT); find the first dead worker, don't debug the transport.</li>
+        <li>Any <code>pip install</code> can silently replace <code>nvidia-nccl-cu13</code>/<code>nvshmem-cu13</code> → <code>deep_ep._C</code> undefined symbols. Re-pin with <code>--force-reinstall --no-deps</code> after EVERY install.</li>
+        <li>gdrdrv kernel 2.4 + libgdrapi 2.5 skew: transport bench passes, serving combine faults CUDA 719 — build the plugin from <code>aws/aws-ofi-nccl@9c44d34</code> + the two committed scripts.</li>
+        <li>ElasticBuffer serve timeouts ≥600 s (frameworks pass none; the 100 s default loses to first-dispatch JIT skew across 16 ranks).</li>
+      </ul>
+    </div>
+    <div class="isnot"><b>Benching</b>
+      <ul>
+        <li>Run test_ep via <b>torchrun, not mp.spawn</b> (spawn overflows NCCL's 256-node XML cap on p5en) — and MASTER_PORT must equal the rdzv port.</li>
+        <li><code>num_max_tokens_per_rank</code> must be <b>uniform across ranks</b> — it's JIT-substituted into the kernel template; divergent values deadlock the barrier.</li>
+        <li>Reap by explicit PID from <code>nvidia-smi</code>, fresh dist port per attempt — leftover GPU contexts corrupt the next measurement (a 22 h-old pod measured 4× slower than a fresh one).</li>
+        <li>A number without the in-log backend assertion (ElasticBuffer + efa provider) is not evidence.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot">
+    July 2026 public-stack re-run. Hardware: 2× p5en.48xlarge, H200, 16 EFA NICs/node, gdrdrv kernel 2.4.
+    Transport: <code>deep_ep.ElasticBuffer</code> over NCCL-GIN type-2 CPU-proxy (never GDAKI/IBGDA — EFA-dead).
+    Every number traces to a committed AIPerf JSON or serve log in
+    <a href="https://github.com/antonai-work/deepep-v2-efa-repro"><code>antonai-work/deepep-v2-efa-repro</code></a>
+    (<code>RESULTS.md</code> is the one-page index). Sanitized — no internal IPs, registry IDs, or hostnames.
+  </div>
+</div>
+</body>
+</html>

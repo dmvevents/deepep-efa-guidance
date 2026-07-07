@@ -19,6 +19,7 @@
     <a href="sections/06-solution-arch.html">6·Architecture</a>
     <a href="sections/07-the-math.html">7·The Math</a>
     <a href="sections/08-v1-nvshmem-backend.html">8·V1 (NVSHMEM)</a>
+    <a href="sections/09-public-repro.html">9·Reproduce</a>
     <a href="calculator/">▸ Calculator</a>
   </nav>
 </header>
@@ -40,7 +41,12 @@
     <b>issue-bound at ~2.2% NIC utilization</b>, paying a fixed <b>+14.7 ms/token</b> host round-trip that the
     all-to-all byte-reduction can't overcome. Use DeepEP for <b>capacity</b> (fitting a model that won't otherwise
     fit) or framework-fit — not for a serving speedup. That speedup needs <b>GPU-initiated transport (GDAKI/IBGDA)</b>,
-    which EFA does not expose today. <b>On InfiniBand the calculus flips.</b></p>
+    which EFA does not expose today. <b>On InfiniBand the calculus flips.</b>
+    <i>July 2026 update:</i> all of this is now reproducible from <b>public roots only</b> (§9), and one
+    efficiency lever measurably converts — striping over 8 NCCL comms (<code>EP_NUM_COMMS=8</code>)
+    <b class="good">doubles vLLM serving throughput</b> by attacking the issue-bound proxy directly. The
+    verdict direction is unchanged (dense still wins on TRT-LLM; capacity/fit is still the reason to use
+    DeepEP), but the gap halves.</p>
   </div>
 
   <h2>The headline numbers (all measured)</h2>
@@ -51,6 +57,8 @@
     <div class="card"><b class="warn">2.2%</b><div class="mut">EFA NIC utilization on dispatch — issue-bound, the wire is 95%+ idle <span class="pill m">measured</span></div></div>
     <div class="card"><b class="good">1.45×</b><div class="mut">where DeepEP DOES win: transport bytes (33 GB/s SO vs UCCL-published 22.77) <span class="pill m">measured</span></div></div>
     <div class="card"><b class="good">3 / 3</b><div class="mut">frameworks serve DeepEP-V2 on EFA + pass AIPerf (SGLang, vLLM, TRT-LLM) <span class="pill m">measured</span></div></div>
+    <div class="card"><b class="good">2×</b><div class="mut">the multicomm lever (EP_NUM_COMMS=8) doubles vLLM on the PURE PUBLIC stack — the one lever that converts to serving tok/s. §9 <span class="pill m">measured</span></div></div>
+    <div class="card"><b class="good">6 / 6</b><div class="mut">gates reproducible from public roots only (micro + 3 engines + Megatron + NeMo-RL) — repo linked in §9 <span class="pill m">measured</span></div></div>
   </div>
 
   <h2>Read in order</h2>
@@ -62,6 +70,7 @@
     <div class="card"><b>§5 · Alternatives</b><div class="mut">dense, UCCL, pplx, IBGDA — do they serve, how fast. <a href="sections/05-alternatives.html">open →</a></div></div>
     <div class="card"><b>§6 · Solution architecture</b><div class="mut">What works today + internal/customer decision trees. <a href="sections/06-solution-arch.html">open →</a></div></div>
     <div class="card"><b>§8 · DeepEP V1 (NVSHMEM backend)</b><div class="mut">The <i>other</i> DeepEP backend — <code>deep_ep.Buffer</code> / NVSHMEM-on-EFA. H200 A/B (ours vs AWS, ~2× gap), the decode LL handle-cache bug + 3.7.0 fix, and the <b>vLLM EP16 serving capstone</b>: the 2× microbench win does <i>not</i> convert (TPOT pinned ~75ms), and "low-latency" is worse than high-throughput. <a href="sections/08-v1-nvshmem-backend.html">open →</a></div></div>
+    <div class="card"><b>§9 · Reproduce it (public roots)</b><div class="mut">The July 2026 re-run: all six gates from public upstreams + committed patches (<code>antonai-work/deepep-v2-efa-repro</code>). NEW: <b>EP_NUM_COMMS=8 multicomm doubles vLLM</b> (39.4/76.5/273.0 vs 19.5/38.8/144.6, ITL halved) — measured on the pure public stack. TRT-LLM native seam replaces the shim at zero cost. <a href="sections/09-public-repro.html">open →</a></div></div>
   </div>
 
   <h2>Try it on your config</h2>
@@ -90,7 +99,9 @@
   <div class="foot">
     Built from the efa-gda campaign (2026). Hardware: 2× p5en.48xlarge, AWS EFA (16 NICs/node, 25 GB/s/NIC
     effective), Qwen3-30B-A3B-FP8 EP16, AIPerf 0.10.0. All numbers traceable to <code>EXP-*</code> docs +
-    <code>evidence/</code>. Sanitized — no internal IPs, registry IDs, or hostnames.
+    <code>evidence/</code>; the July 2026 public-stack re-run is fully reproducible from
+    <a href="https://github.com/antonai-work/deepep-v2-efa-repro"><code>antonai-work/deepep-v2-efa-repro</code></a>.
+    Sanitized — no internal IPs, registry IDs, or hostnames.
   </div>
 </div>
 </body>
