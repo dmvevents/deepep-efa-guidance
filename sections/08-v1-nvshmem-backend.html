@@ -155,12 +155,50 @@
     transport (GDAKI/IBGDA), which EFA does not expose.</p>
   </div>
 
+  <h2>Capstone-2: the same stack under SGLang — and the verdict INVERTS <span class="pill m">measured</span></h2>
+  <p>Same image lineage, same NVSHMEM 3.7.0 + EFA shim, same model and nodes — but served by
+  <b>SGLang 0.5.5.post3</b> (<code>--moe-a2a-backend deepep</code>, TP16 + DP-attention 16). We swept all
+  three <code>--deepep-mode</code> values across the same 4 regimes. On vLLM, "low-latency" was 29&ndash;75%
+  <i>worse</i>. On SGLang, <b><code>low_latency</code> wins every regime</b>:</p>
+  <div class="kpis">
+    <div class="kpi"><div class="n ratio-win">-33%</div><div class="l">LL TPOT vs normal mode — every regime (60-66 vs 91-100 ms)</div></div>
+    <div class="kpi"><div class="n ratio-win">+50%</div><div class="l">LL decode conc32 throughput (497.6 vs 330.9 tok/s)</div></div>
+    <div class="kpi"><div class="n ratio-win">64.3 ms</div><div class="l">SGLang LL decode TPOT — beats vLLM HT (75.2 ms) on the same hw/model</div></div>
+    <div class="kpi"><div class="n">3 fixes</div><div class="l">tokens-per-rank=512, QP_DEPTH=2048, watchdog 100s&rarr;1800s — all in the recipe</div></div>
+  </div>
+  <table>
+    <caption>SGLang 0.5.5.post3, EP16 (TP16 + DP-attn 16), 2&times; p5en/H200, n=64 (conc4) / 256 (conc32) per cell &middot; median TPOT (ms) / output tok/s</caption>
+    <thead><tr><th>regime</th><th>normal</th><th>low_latency</th><th>LL vs normal</th></tr></thead>
+    <tbody>
+      <tr><td>prefill conc4</td><td class="num">92.1 / 41.5</td><td class="num">61.2 / 62.6</td><td class="ratio-win">-34% TPOT</td></tr>
+      <tr><td>prefill conc32</td><td class="num">99.2 / 306.8</td><td class="num">66.3 / 445.8</td><td class="ratio-win">-33% TPOT, +45% tok/s</td></tr>
+      <tr><td>decode conc4</td><td class="num">91.1 / 43.8</td><td class="num">60.4 / 65.8</td><td class="ratio-win">-34% TPOT</td></tr>
+      <tr><td>decode conc32</td><td class="num">96.4 / 330.9</td><td class="num">64.3 / 497.6</td><td class="ratio-win">-33% TPOT, +50% tok/s</td></tr>
+    </tbody>
+  </table>
+  <p class="src">auto mode == normal within noise (auto routes prefill chunks through the normal path).
+  Raw JSONL + logs: <code>capstone/sglang/results/</code> in the repro repo.</p>
+  <div class="panel">
+    <p><b>Why the inversion?</b> SGLang's LL mode captures <b>cuda graphs around
+    <code>low_latency_dispatch</code></b> and keeps the CPU proxy hot; its normal mode force-disables
+    cuda-graph, so per-token Python/launch overhead dominates. vLLM v0.11.0 ran
+    <code>--enforce-eager</code> in <i>both</i> backends, so its LL path only added per-message overhead
+    on the proxy. <b>Which DeepEP mode to use is a framework-integration property (cuda-graph coverage
+    of the dispatch path), not a transport property.</b></p>
+    <p><b>Does this change the site's verdict?</b> It moves the floor, not the direction. The ~75 ms
+    "proxy floor" from the vLLM lane is not a transport constant — cuda-graphed LL pushes it to
+    ~60&ndash;66 ms. But per-token latency still plateaus far above IB-class DeepEP deployments, and no
+    dense-vs-DeepEP A/B was run on SGLang here: this is a <b>better operating point within the same
+    capacity/fit verdict</b>, not evidence of a serving speedup over dense. GPU-initiated transport
+    (GDAKI/IBGDA) remains the lever that would change the direction.</p>
+  </div>
+
   <h2>How vLLM consumes V1 (the inference mapping)</h2>
   <table>
     <thead><tr><th>vLLM all2all backend</th><th>DeepEP V1 call</th><th>regime</th><th>EFA status</th></tr></thead>
     <tbody>
       <tr><td class="num">deepep_high_throughput</td><td class="num">Buffer.dispatch / combine</td><td>prefill &amp; decode</td><td class="ratio-win">works on 3.6.5 &amp; 3.7.0 — BEST TPOT on EFA, use this</td></tr>
-      <tr><td class="num">deepep_low_latency</td><td class="num">Buffer.low_latency_dispatch / combine</td><td>decode</td><td class="ratio-lose">3.7.0 only; 29–75% worse TPOT than HT on EFA</td></tr>
+      <tr><td class="num">deepep_low_latency</td><td class="num">Buffer.low_latency_dispatch / combine</td><td>decode</td><td class="ratio-lose">3.7.0 only; 29–75% worse TPOT than HT on EFA <i>under vLLM</i> (SGLang inverts this — see Capstone-2)</td></tr>
     </tbody>
   </table>
   <p class="src">Verified in vLLM <code>distributed/device_communicators/all2all.py</code>:
@@ -189,7 +227,7 @@
   <div class="foot">
     V1 A/B from the nvshmem-efa campaign (2026-06-24/25). Hardware: 2× p5en.48xlarge, H200, 16 EFA NICs.
     Stacks: ours NVSHMEM 3.6.5-0 + SWAP + direct-signal-v1 vs AWS NVSHMEM 3.7.0 + <code>deepep_aws_efa.patch</code>
-    (DeepEP 567632d). Capstone serving = vLLM v0.11.0 EP16, Qwen3-30B-A3B-FP8, enforce-eager.
+    (DeepEP 567632d). Capstone serving = vLLM v0.11.0 EP16 (enforce-eager) + Capstone-2 SGLang 0.5.5.post3 EP16 (2026-07-07), both Qwen3-30B-A3B-FP8.
     Reproducible repo + raw logs + the 3-file serving recipe (Dockerfile / serve.yaml / run_test.sh):
     <code>github.com/dmvevents/deepep-efa-ab-h200</code> (see <code>capstone/</code>).
     Sanitized — no internal IPs, registry IDs, or hostnames.
