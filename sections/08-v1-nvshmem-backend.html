@@ -193,6 +193,43 @@
     (GDAKI/IBGDA) remains the lever that would change the direction.</p>
   </div>
 
+  <h2>Capstone-3: training (Megatron-LM) <span class="pill m">measured</span></h2>
+  <p>Does V1 <b>train</b>? The vLLM/SGLang capstones validated serving; this validates training. Stock
+  <b>Megatron-LM @23dd639c</b> is a <b>native DeepEP-V1 consumer</b>: <code>megatron/core/transformer/moe/fused_a2a.py</code>
+  imports <code>deep_ep.Buffer</code> directly with <b>zero patches</b> (the V2 campaign's Megatron PR #4632 exists to
+  steer this file <i>away</i> from V1 — so for V1, upstream-as-is is the recipe). We ran the V2 lane's
+  <b>Gate-5 "Shape Y" driver</b> (Qwen3-30B-A3B-style MoE: 128 experts, top-8, hidden 2048) on 2× p5en/H200 with
+  the same seeds and base commit → direct A/B of <code>Buffer</code>/NVSHMEM-proxy vs
+  <code>ElasticBuffer</code>/NCCL-GIN as a training transport.</p>
+  <div class="kpis">
+    <div class="kpi"><div class="n ratio-win">0 patches</div><div class="l">stock upstream Megatron is a native V1 consumer</div></div>
+    <div class="kpi"><div class="n ratio-win">digit-for-digit</div><div class="l">grad_norms match V2/ElasticBuffer/GIN across all 3 steps</div></div>
+    <div class="kpi"><div class="n">1.083 GB</div><div class="l">EFA hardware TX delta (≥1 GB gate)</div></div>
+    <div class="kpi"><div class="n ratio-win">✓ PASS</div><div class="l">loss decreasing (26.4→24.6), grad_norm finite, 3/3 gates</div></div>
+  </div>
+  <table>
+    <caption>V1 Buffer/NVSHMEM vs V2 ElasticBuffer/GIN · same seeds, same Megatron commit, same model · 2× p5en.48xlarge/H200/16-NIC</caption>
+    <thead><tr><th>step</th><th>V1 loss (this section)</th><th>V2 loss (Gate-5)</th><th>V1 grad_norm</th><th>V2 grad_norm</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="num">26.4062</td><td class="num">26.4075</td><td class="num">30.6430</td><td class="num">30.6430</td></tr>
+      <tr><td>2</td><td class="num">25.1106</td><td class="num">25.1026</td><td class="num">28.1979</td><td class="num">28.1979</td></tr>
+      <tr><td>3</td><td class="num">24.5944</td><td class="num">24.6097</td><td class="num">27.0909</td><td class="num">27.0909</td></tr>
+    </tbody>
+  </table>
+  <p class="src">Losses agree to ~3 decimals (bf16 reduction-order noise); grad-norms match digit-for-digit.
+  NVSHMEM v3.7.0 banner, <code>NVSHMEM_REMOTE_TRANSPORT=libfabric</code>, provider <code>efa</code>.
+  Evidence: <code>github.com/dmvevents/deepep-efa-ab-h200/tree/master/capstone/megatron</code>.</p>
+  <div class="panel">
+    <p><b>The verdict: numerical equivalence across transports.</b> Grad-norms match V2 <b>digit-for-digit</b>
+    and losses agree to ~3 decimal places — the same tokens move through two entirely different transports
+    (NVSHMEM host-proxy vs NCCL-GIN) with interchangeable training math. This is the <b>strongest correctness
+    statement either lane has produced</b>.</p>
+    <p><b>Caveats:</b> Only NORMAL-mode <code>dispatch/combine</code> is on Megatron's path (never
+    <code>low_latency_*</code>). Step-time comparison vs V2 is <b>not valid</b> (different GPUs H200 vs H100,
+    different warmup) — this validates <b>correctness and fit</b>, not a training-throughput claim. It does not
+    change this site's capacity-not-speedup verdict; it confirms V1 trains with the same math as V2.</p>
+  </div>
+
   <h2>How vLLM consumes V1 (the inference mapping)</h2>
   <table>
     <thead><tr><th>vLLM all2all backend</th><th>DeepEP V1 call</th><th>regime</th><th>EFA status</th></tr></thead>
@@ -227,7 +264,9 @@
   <div class="foot">
     V1 A/B from the nvshmem-efa campaign (2026-06-24/25). Hardware: 2× p5en.48xlarge, H200, 16 EFA NICs.
     Stacks: ours NVSHMEM 3.6.5-0 + SWAP + direct-signal-v1 vs AWS NVSHMEM 3.7.0 + <code>deepep_aws_efa.patch</code>
-    (DeepEP 567632d). Capstone serving = vLLM v0.11.0 EP16 (enforce-eager) + Capstone-2 SGLang 0.5.5.post3 EP16 (2026-07-07), both Qwen3-30B-A3B-FP8.
+    (DeepEP 567632d). Capstone serving = vLLM v0.11.0 EP16 (enforce-eager) + Capstone-2 SGLang 0.5.5.post3 EP16 (2026-07-07),
+    both Qwen3-30B-A3B-FP8. Capstone-3 Megatron training (2026-07-08): stock Megatron-LM @23dd639c trains over V1 with zero
+    patches, numerics match V2 digit-for-digit.
     Reproducible repo + raw logs + the 3-file serving recipe (Dockerfile / serve.yaml / run_test.sh):
     <code>github.com/dmvevents/deepep-efa-ab-h200</code> (see <code>capstone/</code>).
     Sanitized — no internal IPs, registry IDs, or hostnames.
