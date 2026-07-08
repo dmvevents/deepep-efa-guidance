@@ -67,7 +67,7 @@
     <caption>All measured 2026-06-25 → 2026-07-08 · 2× p5en.48xlarge / H200 / 16 EFA NICs · Qwen3-30B-A3B(-FP8) · evidence: dmvevents/deepep-efa-ab-h200 capstone/</caption>
     <thead><tr><th>capstone</th><th>framework</th><th>workload</th><th>headline result</th></tr></thead>
     <tbody>
-      <tr><td>C1</td><td>vLLM v0.11.1 (source)</td><td>EP16 serving, both backends</td><td>TPOT pinned ~73–77 ms (HT); LL 29–75% worse — under enforce-eager</td></tr>
+      <tr><td>C1</td><td>vLLM v0.11.1 (source)</td><td>EP16 serving, both backends</td><td class="ratio-win">eager verdict revised: graphed LL wins decode (61.6-65.0 ms, 1.06-1.08× dense), HT unchanged</td></tr>
       <tr><td>C2</td><td>SGLang 0.5.5.post3 (stock)</td><td>EP16 serving, 3 deepep-modes</td><td class="ratio-win">INVERTS C1: LL wins everywhere, 60–66 ms TPOT, decode c32 497.6 tok/s (+50%)</td></tr>
       <tr><td>C3</td><td>Megatron-LM 23dd639c (stock, 0 patches)</td><td>2-node MoE training</td><td class="ratio-win">loss 26.41→24.59; grad-norms match V2 digit-for-digit; EFA TX 1.083 GB</td></tr>
       <tr><td>C4</td><td>NeMo-RL 46be4e8</td><td>full GRPO e2e (rollout→reward→train→refit)</td><td class="ratio-win">3/3 steps, internode EP4, EFA TX 537 GB/node</td></tr>
@@ -86,7 +86,7 @@
       <ul>
         <li><b>Raw serving tok/s across campaigns</b> (different harnesses: AIPerf vs vllm bench/sglang.bench_serving; different framework versions: vLLM 0.24 vs 0.11.1, SGLang 0.5.11 vs 0.5.5) — single-harness A/B not yet run.</li>
         <li><b>Training step-times</b> (H200 vs H100, different warmup).</li>
-        <li><b>Any claim that the verdict flipped:</b> the CPU-proxy ceiling stands; V1 moved the floor (75→60-66 ms via cuda-graphed LL), not the direction. Dense/allgather baselines on V1 remain unrun — the biggest open gap.</li>
+        <li><b>Any claim that the verdict flipped:</b> the CPU-proxy ceiling stands; V1 moved the floor (75→60-66 ms via cuda-graphed LL), not the direction. The vLLM dense/allgather A/B is now complete (HT 0.89-0.93× dense = V1 mirror of V2's verdict); SGLang dense arm remains open.</li>
       </ul>
     </div>
   </div>
@@ -173,6 +173,40 @@
       <tr><td>decode conc32</td><td class="num">75.2</td><td class="num">98.2</td><td class="ratio-lose">+31% worse</td><td class="num">424.9</td><td class="num">324.9</td></tr>
     </tbody>
   </table>
+
+  <h3>REVISED: the eager confound, resolved (2026-07-08) <span class="pill m">measured</span></h3>
+  <p>The original matrix above ran both backends <code>--enforce-eager</code> because NGC triton lacks
+  <code>triton_key</code>. We retested with <code>-O.level=0 -O.cudagraph_mode=FULL</code> (level-0
+  compilation never touches inductor, so no <code>triton_key</code>; CUDA graphs capture fully). LL improves
+  21-38% TPOT; HT is unchanged (within 1.4% — it was never eager-limited).</p>
+  <div class="kpis">
+    <div class="kpi"><div class="n ratio-win">-13/-14%</div><div class="l">LL TPOT decode (61.6/65.0 ms) — beats HT (71.8/74.9 ms) when graphed</div></div>
+    <div class="kpi"><div class="n ratio-lose">+7/8%</div><div class="l">LL TPOT prefill (77.9/83.4 ms) — loses to HT (72.5/77.6 ms)</div></div>
+    <div class="kpi"><div class="n ratio-win">1.06-1.08×</div><div class="l">graphed LL decode vs dense (eager) throughput — first measured DeepEP-beats-dense serving</div></div>
+    <div class="kpi"><div class="n ratio-tie">~60-65 ms</div><div class="l">vLLM LL vs SGLang LL floor — frameworks converge when dispatch is cuda-graphed</div></div>
+  </div>
+  <table>
+    <caption>vLLM v0.11.1, CUDA graphs (level-0/FULL), same 4 regimes + dense allgather_reducescatter baseline (eager, matching the V2 campaign's dense-arm methodology) · n=64/256</caption>
+    <thead><tr><th>regime</th><th>dense (eager) TPOT / toks</th><th>HT graphed</th><th>LL graphed</th><th>LL/dense toks</th></tr></thead>
+    <tbody>
+      <tr><td>prefill c4</td><td class="num">65.3 / 58.8</td><td class="num">72.5 / 53.5</td><td class="num">77.9 / 45.6</td><td class="ratio-lose">0.78×</td></tr>
+      <tr><td>decode c4</td><td class="num">66.5 / 59.6</td><td class="num">71.8 / 55.4</td><td class="num">61.6 / 64.6</td><td class="ratio-win">1.08×</td></tr>
+      <tr><td>prefill c32</td><td class="num">70.2 / 420.9</td><td class="num">77.6 / 373.6</td><td class="num">83.4 / 188.8</td><td class="ratio-lose">0.45×</td></tr>
+      <tr><td>decode c32</td><td class="num">68.5 / 462.7</td><td class="num">74.9 / 425.1</td><td class="num">65.0 / 488.7</td><td class="ratio-win">1.06×</td></tr>
+    </tbody>
+  </table>
+  <p class="src">Evidence: <code>dmvevents/deepep-efa-ab-h200</code> commit 55c322a, <code>capstone/results/{cudagraph-retest,dense-ab}/</code>. Retest 2026-07-08. Dense arm run under eager (no cudagraph, matching the V2 campaign's dense-arm methodology).</p>
+  <div class="panel">
+    <p><b>LL-worse-on-vLLM was an eager artifact.</b> Cuda-graphed LL beats HT in decode (-13/-14%), loses
+    prefill (+7/8%): <b>mode-per-phase</b>, as the SGLang lane predicted. Frameworks <b>CONVERGE</b> once dispatch
+    is cuda-graphed: vLLM LL decode c32 65.0 ms / 488.7 tok/s vs SGLang LL 64.3 / 497.6 — the ~60-65 ms floor
+    is the transport, not the framework.</p>
+    <p><b>First measured DeepEP-beats-dense serving cells on EFA</b> in either campaign (graphed LL 1.06-1.08×
+    decode throughput) — but dense wins prefill decisively and remains the safe single-mode default. <b>The
+    site's capacity-not-speedup verdict STANDS overall;</b> this adds a measured decode-heavy exception, not
+    a reversal.</p>
+  </div>
+
   <div class="panel">
     <p><b>The 2× microbench win does NOT convert to serving.</b> HT per-user TPOT is pinned at <b>~73–77 ms
     across every regime</b> (p99 within 1 ms of p50 in decode). Aggregate throughput scales with concurrency,
@@ -214,7 +248,8 @@
     <code>low_latency_dispatch</code></b> and keeps the CPU proxy hot; its normal mode force-disables
     cuda-graph, so per-token Python/launch overhead dominates. vLLM v0.11.0 ran
     <code>--enforce-eager</code> in <i>both</i> backends, so its LL path only added per-message overhead
-    on the proxy. <b>Which DeepEP mode to use is a framework-integration property (cuda-graph coverage
+    on the proxy (this was subsequently confirmed and resolved — see the REVISED eager-confound block in
+    the Capstone-1 section above). <b>Which DeepEP mode to use is a framework-integration property (cuda-graph coverage
     of the dispatch path), not a transport property.</b></p>
     <p><b>Does this change the site's verdict?</b> It moves the floor, not the direction. The ~75 ms
     "proxy floor" from the vLLM lane is not a transport constant — cuda-graphed LL pushes it to
@@ -340,6 +375,9 @@
     both Qwen3-30B-A3B-FP8. Capstone-3 Megatron training (2026-07-08): stock Megatron-LM @23dd639c trains over V1 with zero
     patches, numerics match V2 digit-for-digit. Capstone-4 NeMo-RL GRPO (2026-07-08): stock NeMo-RL @46be4e8 drives full
     GRPO loop (rollout→reward→train→refit) through V1, 3/3 steps PASS, 537 GB/node EFA TX.
+    <b>Gap-closure retest (2026-07-08):</b> vLLM eager-confound resolved via CUDA graphs (level-0/FULL); LL beats HT in
+    decode (-13/-14%), dense A/B complete (LL 1.06-1.08× dense decode, HT 0.89-0.93× dense). Evidence: commit 55c322a,
+    <code>capstone/results/{cudagraph-retest,dense-ab}/</code>.
     Reproducible repo + raw logs + the 3-file serving recipe (Dockerfile / serve.yaml / run_test.sh):
     <code>github.com/dmvevents/deepep-efa-ab-h200</code> (see <code>capstone/</code>).
     Campaign rollup + V1-vs-V2 comparison gist (private): available on request; all numbers trace to capstone/ in the evidence repo.
