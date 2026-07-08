@@ -230,6 +230,47 @@
     change this site's capacity-not-speedup verdict; it confirms V1 trains with the same math as V2.</p>
   </div>
 
+  <h2>Capstone-4: the full RL loop (NeMo-RL GRPO) <span class="pill m">measured</span></h2>
+  <p>Does V1 <b>train with reinforcement learning</b>? The vLLM/SGLang capstones validated inference
+  serving; Capstone-3 validated supervised training. This validates the <b>complete GRPO loop</b>
+  (rollout generation → reward → training → weight refit) — the stack V2's Gate-6 explicitly skipped
+  as "too heavyweight". Stock <b>NeMo-RL @46be4e8</b> drove <b>3 complete GRPO steps</b> on
+  Qwen3-30B-A3B across 2× p5en/H200, using <b>vLLM colocated rollout generation</b> (32 MATH completions
+  per step, mean ~927 tokens), reward calculation, <b>GRPO policy training through stock Megatron
+  <code>fused_a2a.py</code></b> (<code>deep_ep.Buffer</code> → NVSHMEM 3.7.0 → EFA), and <b>ZMQ weight
+  refit</b> back into vLLM (3.4 s per step).</p>
+  <div class="kpis">
+    <div class="kpi"><div class="n ratio-win">3/3 steps</div><div class="l">full RL loop: rollout→reward→train→refit</div></div>
+    <div class="kpi"><div class="n">537 GB/node</div><div class="l">EFA hardware TX delta (internode EP4, NIC counters verified)</div></div>
+    <div class="kpi"><div class="n">3.4 s</div><div class="l">Megatron→vLLM weight refit via ZMQ</div></div>
+    <div class="kpi"><div class="n ratio-win">0 forks</div><div class="l">stock NeMo-RL + stock Megatron (1-hunk torch-2.8 guard only)</div></div>
+  </div>
+  <table>
+    <caption>TP4/PP1/EP4, Qwen3-30B-A3B, 2× p5en.48xlarge/H200/16-NIC · 3 steps × 8 prompts × 4 generations on MATH</caption>
+    <thead><tr><th>step</th><th>Loss</th><th>Avg Reward</th><th>step time (s)</th></tr></thead>
+    <tbody>
+      <tr><td>1/3</td><td class="num">0.0003</td><td class="num">0.1875</td><td class="num">63.1</td></tr>
+      <tr><td>2/3</td><td class="num">0.0459</td><td class="num">0.0625</td><td class="num">85.4</td></tr>
+      <tr><td>3/3</td><td class="num">0.0232</td><td class="num">0.5312</td><td class="num">98.1</td></tr>
+    </tbody>
+  </table>
+  <p class="src">Timing split (step 3): generation 62%, policy training 8%, refit 4%. Rollouts are
+  real — 32 completions/step, logged with rewards/advantages/logprobs. Source:
+  <code>github.com/dmvevents/deepep-efa-ab-h200/tree/master/capstone/nemo-rl</code> (commit bc930e7).</p>
+  <div class="panel">
+    <p><b>The verdict: every stage of the RL loop executes coherently over V1.</b> The expert-parallel
+    a2a genuinely crossed nodes (TP4/PP1/EP4 topology, verified with EFA hardware TX counters at 537 GB/node).
+    Megatron policy training routed through stock <code>fused_a2a.py</code> (<code>deep_ep.Buffer</code>),
+    and weight streaming back to vLLM's generation engine completed in 3.4 s per step.</p>
+    <p><b>Honest caveats:</b> 3 steps × 8 prompts is a <b>transport-validation shape, not a convergence
+    claim</b> — reward numbers at n=32 samples/step are high-variance noise (0.19 → 0.06 → 0.53 is
+    sampling variance, not learning progress). GRPO loss is near zero by construction at this scale. What
+    this run <i>does</i> prove: the full loop (rollout + reward + training + refit) works end-to-end on V1.</p>
+    <p><b>The PP2 gotcha:</b> an earlier PP2/EP2 run "passed" identically, but its PP boundary aligned with
+    the node boundary → EP groups landed intranode, so DeepEP never touched EFA (TX counters were near zero).
+    PP1/EP4 forces expert groups to span both nodes. <b>NIC counters, not exit codes, are the gate.</b></p>
+  </div>
+
   <h2>How vLLM consumes V1 (the inference mapping)</h2>
   <table>
     <thead><tr><th>vLLM all2all backend</th><th>DeepEP V1 call</th><th>regime</th><th>EFA status</th></tr></thead>
@@ -266,7 +307,8 @@
     Stacks: ours NVSHMEM 3.6.5-0 + SWAP + direct-signal-v1 vs AWS NVSHMEM 3.7.0 + <code>deepep_aws_efa.patch</code>
     (DeepEP 567632d). Capstone serving = vLLM v0.11.0 EP16 (enforce-eager) + Capstone-2 SGLang 0.5.5.post3 EP16 (2026-07-07),
     both Qwen3-30B-A3B-FP8. Capstone-3 Megatron training (2026-07-08): stock Megatron-LM @23dd639c trains over V1 with zero
-    patches, numerics match V2 digit-for-digit.
+    patches, numerics match V2 digit-for-digit. Capstone-4 NeMo-RL GRPO (2026-07-08): stock NeMo-RL @46be4e8 drives full
+    GRPO loop (rollout→reward→train→refit) through V1, 3/3 steps PASS, 537 GB/node EFA TX.
     Reproducible repo + raw logs + the 3-file serving recipe (Dockerfile / serve.yaml / run_test.sh):
     <code>github.com/dmvevents/deepep-efa-ab-h200</code> (see <code>capstone/</code>).
     Sanitized — no internal IPs, registry IDs, or hostnames.
