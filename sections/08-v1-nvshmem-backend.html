@@ -60,6 +60,37 @@
   <p class="src">Both are CPU-proxy paths on EFA. Neither uses GPU-initiated RDMA — EFA exposes no IBGDA. The
   "proxy tax" §2 describes applies to V1 too.</p>
 
+  <h2>The V1 campaign scoreboard — four frameworks, one transport</h2>
+  <p>All four capstones are complete. The same NVSHMEM/EFA transport validated across serving (vLLM + SGLang),
+  training (Megatron), and full RL (NeMo-RL GRPO):</p>
+  <table>
+    <caption>All measured 2026-06-25 → 2026-07-08 · 2× p5en.48xlarge / H200 / 16 EFA NICs · Qwen3-30B-A3B(-FP8) · evidence: dmvevents/deepep-efa-ab-h200 capstone/</caption>
+    <thead><tr><th>capstone</th><th>framework</th><th>workload</th><th>headline result</th></tr></thead>
+    <tbody>
+      <tr><td>C1</td><td>vLLM v0.11.1 (source)</td><td>EP16 serving, both backends</td><td>TPOT pinned ~73–77 ms (HT); LL 29–75% worse — under enforce-eager</td></tr>
+      <tr><td>C2</td><td>SGLang 0.5.5.post3 (stock)</td><td>EP16 serving, 3 deepep-modes</td><td class="ratio-win">INVERTS C1: LL wins everywhere, 60–66 ms TPOT, decode c32 497.6 tok/s (+50%)</td></tr>
+      <tr><td>C3</td><td>Megatron-LM 23dd639c (stock, 0 patches)</td><td>2-node MoE training</td><td class="ratio-win">loss 26.41→24.59; grad-norms match V2 digit-for-digit; EFA TX 1.083 GB</td></tr>
+      <tr><td>C4</td><td>NeMo-RL 46be4e8</td><td>full GRPO e2e (rollout→reward→train→refit)</td><td class="ratio-win">3/3 steps, internode EP4, EFA TX 537 GB/node</td></tr>
+    </tbody>
+  </table>
+  <div class="twocol">
+    <div class="is"><b>V1-vs-V2: valid comparisons</b>
+      <ul>
+        <li><b>Megatron numerics:</b> same seeds/driver/base commit → digit-for-digit grad-norm equivalence across NVSHMEM-proxy vs NCCL-GIN — the only controlled cross-transport A/B in either campaign.</li>
+        <li><b>Integration cost:</b> V1 needed FEWER patches everywhere (SGLang stock vs V2 seam patch; Megatron 0 commits vs 3; NeMo-RL 1-hunk guard) — frameworks natively speak the V1 Buffer API.</li>
+        <li><b>Validation depth:</b> V1 ran the actual GRPO loop; V2's gate was an import-chain wrapper.</li>
+        <li><b>Mode choice is a framework property:</b> cuda-graph coverage of the dispatch path decides HT-vs-LL, not the wire.</li>
+      </ul>
+    </div>
+    <div class="isnot"><b>NOT valid to compare</b>
+      <ul>
+        <li><b>Raw serving tok/s across campaigns</b> (different harnesses: AIPerf vs vllm bench/sglang.bench_serving; different framework versions: vLLM 0.24 vs 0.11.1, SGLang 0.5.11 vs 0.5.5) — single-harness A/B not yet run.</li>
+        <li><b>Training step-times</b> (H200 vs H100, different warmup).</li>
+        <li><b>Any claim that the verdict flipped:</b> the CPU-proxy ceiling stands; V1 moved the floor (75→60-66 ms via cuda-graphed LL), not the direction. Dense/allgather baselines on V1 remain unrun — the biggest open gap.</li>
+      </ul>
+    </div>
+  </div>
+
   <h2>The headline: ours vs AWS on H200 (same nodes, same DeepEP tuner)</h2>
   <div class="kpis">
     <div class="kpi"><div class="n ratio-lose">1.9×</div><div class="l">AWS faster — prefill BF16 dispatch (71.6 vs our 37.0 GB/s RDMA)</div></div>
@@ -311,6 +342,7 @@
     GRPO loop (rollout→reward→train→refit) through V1, 3/3 steps PASS, 537 GB/node EFA TX.
     Reproducible repo + raw logs + the 3-file serving recipe (Dockerfile / serve.yaml / run_test.sh):
     <code>github.com/dmvevents/deepep-efa-ab-h200</code> (see <code>capstone/</code>).
+    Campaign rollup + V1-vs-V2 comparison gist (private): available on request; all numbers trace to capstone/ in the evidence repo.
     Sanitized — no internal IPs, registry IDs, or hostnames.
   </div>
 </div>
