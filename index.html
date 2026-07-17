@@ -20,6 +20,7 @@
     <a href="sections/07-the-math.html">7·The Math</a>
     <a href="sections/08-v1-nvshmem-backend.html">8·V1 (NVSHMEM)</a>
     <a href="sections/09-public-repro.html">9·Reproduce</a>
+    <a href="sections/10-gpu-initiated-native.html">10·GPU-init</a>
     <a href="calculator/">▸ Calculator</a>
   </nav>
 </header>
@@ -71,6 +72,7 @@
     <div class="card"><b>§6 · Solution architecture</b><div class="mut">What works today + internal/customer decision trees. <a href="sections/06-solution-arch.html">open →</a></div></div>
     <div class="card"><b>§8 · DeepEP V1 (NVSHMEM backend)</b><div class="mut"><b>Campaign complete: four capstones</b> (vLLM, SGLang, Megatron, NeMo-RL GRPO) measured 2026-06-25 → 2026-07-08 — serving + training + full RL over the same NVSHMEM/EFA transport. SGLang <b>inverts</b> the vLLM result (LL wins via cuda-graph: 60–66 ms TPOT, decode c32 +50% tok/s). Megatron digit-for-digit numerics vs V2 (the only controlled cross-transport A/B). Integration cost: V1 needed <i>fewer</i> patches (SGLang stock, Megatron 0 commits, NeMo-RL 1-hunk). H200 A/B (ours vs AWS, ~2× prefill gap), decode LL handle-cache bug + 3.7.0 fix. <b>Gap-closure retest:</b> the vLLM LL-worse verdict was an eager artifact — cuda-graphed LL converges with SGLang (~60-65 ms) and edges dense 1.06-1.08× in decode. <a href="sections/08-v1-nvshmem-backend.html">open →</a></div></div>
     <div class="card"><b>§9 · Reproduce it (public roots)</b><div class="mut">The July 2026 re-run: all six gates from public upstreams + committed patches (<code>antonai-work/deepep-v2-efa-repro</code>). NEW: <b>EP_NUM_COMMS=8 multicomm doubles vLLM</b> (39.4/76.5/273.0 vs 19.5/38.8/144.6, ITL halved) — measured on the pure public stack. TRT-LLM native seam replaces the shim at zero cost. <a href="sections/09-public-repro.html">open →</a></div></div>
+    <div class="card"><b>§10 · GPU-initiated (native, no proxy)</b><div class="mut"><b>Campaign 2026-07-09→17:</b> GPU kernels post WQEs directly to the EFA NIC — correct (torch.equal, receiver-landing-proof) and <b>faster than the CPU proxy</b>: dispatch 338.5 vs 391.6 µs, combine 480.7 vs 543.4 µs (decode, EP16). Honest residual: ~2.5–2.9× off the IB reference, attributed by experiment to EFA-SRD wire/readiness physics (73% fewer doorbells moved latency ~0; cached dispatch is 90% receiver-poll). Site verdict unchanged — the proxy stays the supported path. <a href="sections/10-gpu-initiated-native.html">open →</a></div></div>
   </div>
 
   <h2>Try it on your config</h2>

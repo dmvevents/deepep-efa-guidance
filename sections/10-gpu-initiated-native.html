@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§10 · GPU-initiated on EFA — the native path measured against the proxy</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .kpi{background:var(--panel2,#161616);border:1px solid var(--line,#2a2a2a);border-radius:9px;padding:13px 14px}
+  .kpi .n{font:22px/1.1 var(--mono);font-weight:700}
+  .kpi .l{font-size:11px;color:var(--mut);margin-top:5px;text-transform:uppercase;letter-spacing:.4px}
+  .src{font:11px var(--mono);color:var(--mut)}
+  .num{font:12px var(--mono)}
+  .ratio-tie{color:var(--warn);font-weight:700}
+  .ratio-lose{color:var(--bad);font-weight:700}
+  .ratio-win{color:var(--good);font-weight:700}
+  caption{caption-side:top;text-align:left;color:var(--mut);font-size:12px;padding:4px 0}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <span class="brand">DeepEP on EFA</span>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html">01 · What is DeepEP</a>
+    <a href="02-efa-vs-infiniband.html">02 · IB vs EFA</a>
+    <a href="03-scaling.html">03 · Drop-in</a>
+    <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+    <a href="05-alternatives.html">05 · Alternatives</a>
+    <a href="06-solution-arch.html">06 · Recipe</a>
+    <a href="07-the-math.html">07 · The Math</a>
+    <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
+    <a href="09-public-repro.html">09 · Reproduce it</a>
+    <a href="10-gpu-initiated-native.html" style="color:var(--ink)">10 · GPU-initiated</a>
+    <a href="../calculator/">Calculator</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <h1>§10 · GPU-initiated on EFA — the native path, measured against the proxy <span class="pill m">measured</span></h1>
+  <p class="sub">Every earlier section runs DeepEP-V2 through the <b>CPU-proxy</b> GIN backend: a host thread posts
+  the RDMA work. This campaign built the path everyone asks about — <b>GPU kernels posting WQEs directly to the EFA
+  NIC</b> (kernel-posted-WQE, CQ-poll completion, no hardware counters needed) — got it <b>correct</b>, and then
+  spent a week of one-lever-at-a-time optimization finding out exactly where the remaining microseconds live.
+  The result is a first: <b class="good">native GPU-initiated beats the CPU proxy on both dispatch and combine</b>
+  at decode shape on EFA. The result is also honest: it does <b>not</b> reach InfiniBand-class latency, and we can
+  now say why with evidence rather than intuition.</p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="n">338.5 µs</div><div class="l">native dispatch p50 (proxy 391.6)</div></div>
+    <div class="kpi"><div class="n">480.7 µs</div><div class="l">native combine p50 (proxy 543.4)</div></div>
+    <div class="kpi"><div class="n">100%</div><div class="l">torch.equal vs NCCL ref, ≥2 reps</div></div>
+    <div class="kpi"><div class="n">377</div><div class="l">falsified-hypothesis ledger entries</div></div>
+  </div>
+
+  <h2>The headline table</h2>
+  <table>
+    <caption>2× p5en.48xlarge (H200, 16 EFA NICs/node) · 16 EP ranks · N=128 decode shape · p50 across valid reps · banked 2026-07-14, unchanged by the 2026-07-17 re-bank</caption>
+    <thead><tr><th>axis</th><th>native GPU-initiated</th><th>CPU proxy</th><th>verdict</th></tr></thead>
+    <tbody>
+      <tr><td>dispatch</td><td class="num">338.5 µs</td><td class="num">391.6 µs</td><td class="ratio-win">native −53 µs (~14%)</td></tr>
+      <tr><td>combine</td><td class="num">480.7 µs</td><td class="num">543.4 µs</td><td class="ratio-win">native −63 µs (~12%)</td></tr>
+      <tr><td>cached dispatch</td><td class="num">~401 µs</td><td class="num">~274 µs</td><td class="ratio-lose">proxy wins (see attribution)</td></tr>
+    </tbody>
+  </table>
+  <p class="src">source: gda-native-campaign/results/campaign-summary.json in the evidence repo. Correctness gate: dispatch+combine torch.equal == NCCL reference with receiver-side landing proof — local send-CQ success was never accepted as delivery.</p>
+
+  <h2>How it got there — the lever ladder</h2>
+  <p>The first valid A/B (2026-07-10) had the native path <b>2× slower</b> than the proxy. One-variable-at-a-time
+  optimization, each lever preregistered with validate/refute bands and adjudicated by an independent reviewer:</p>
+  <table>
+    <caption>each row = one gated experiment with custody (preflight, source hashes, rank rc, hygiene)</caption>
+    <thead><tr><th>lever</th><th>outcome</th></tr></thead>
+    <tbody>
+      <tr><td>QP fanout fix (stop reserving a notify-only QP when SMs need data QPs)</td><td class="num ratio-win">dispatch 789 → 538 µs</td></tr>
+      <tr><td>QP17 production shape + ownership</td><td class="num ratio-win">validated baseline</td></tr>
+      <tr><td>lazy completion on dispatch (skip per-put credit check when SQ overflow provably impossible)</td><td class="num ratio-win">−30 µs; completion-wait → 0%</td></tr>
+      <tr><td>lazy completion on combine (C-1)</td><td class="num ratio-win">−91 µs combine</td></tr>
+      <tr><td>batched doorbells (B=8)</td><td class="num ratio-tie">refuted as dominant (−2.8 µs)</td></tr>
+      <tr><td>write-with-immediate receiver counting</td><td class="num ratio-lose">falsified: +382 µs sender-WQE tax</td></tr>
+      <tr><td>provider batched-tail</td><td class="num ratio-lose">correct but +198 µs</td></tr>
+      <tr><td>multi-WQE span posting (put_many)</td><td class="num ratio-lose">parked: deterministic hang, codegen-fragile (5 fix classes falsified, SASS forensics banked)</td></tr>
+      <tr><td>deferred-doorbell aggregation (73% fewer doorbell+fence events)</td><td class="num ratio-tie">engaged, latency FLAT — then intermittent correctness fault; parked</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Why the IB gap stays — three measured facts</h2>
+  <div class="panel">
+    <p><b>1. Completion-wait is gone.</b> After lazy completion, profiled combine put-path completion-wait is
+    <b>0.00%</b> over 15.6k sampled rows (it was 38.6% before — the same instrument measured both).</p>
+    <p><b>2. Issue-side cost is overlapped.</b> The aggregation experiment cut doorbell+fence events by 73% —
+    and combine p50 moved ~0 µs. The ring/fence cycles the profiler attributes (72% of put cost) are hidden
+    under wire time. Optimizing them buys nothing.</p>
+    <p><b>3. Cached dispatch is receiver physics.</b> The one axis the proxy still wins is 89.96%
+    receiver-forward poll wait (8.96× wait/body) — waiting for tokens to land and become visible, not posting them.</p>
+  </div>
+  <p>Against the DeepEP-V2 IB/IBGDA reference (~118/195 µs), native EFA remains ~2.5–2.9×. The residual is
+  EFA-SRD wire and readiness behavior (no ordering, receiver-visibility latency), not host or issue-side code.</p>
+
+  <h2>What this changes — and what it doesn't</h2>
+  <div class="twocol">
+    <div class="is">
+      <h3>it IS</h3>
+      <ul>
+        <li>proof GPU-initiated DeepEP-V2 dispatch/combine is <b>correct</b> on EFA (no hardware counters needed — CQ-poll completion)</li>
+        <li>a measured native win over the proxy on dispatch and combine at decode shape</li>
+        <li>an evidence-backed attribution of every remaining microsecond class</li>
+      </ul>
+    </div>
+    <div class="isnot">
+      <h3>it is NOT</h3>
+      <ul>
+        <li>a production path — it needs a patched plugin/NCCL stack; the proxy (§3–§9) remains the supported recipe</li>
+        <li>an IB-parity claim — the ~2.5–2.9× reference gap stands, now with physics-level evidence</li>
+        <li>a change to the site verdict: DeepEP on EFA is a capacity/fit play; this moves the research frontier within it</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot">
+    Campaign 2026-07-09 → 2026-07-17 · 2× p5en.48xlarge (H200, 16 EFA NICs/node) · DeepEP-V2 type-5 EFA-GDA vs
+    NCCL_GIN_TYPE=2 proxy · 16 EP ranks, N=128 decode · every number traces to
+    <a href="https://github.com/antonai-work/deepep-v2-efa-repro/tree/main/gda-native-campaign">deepep-v2-efa-repro/gda-native-campaign</a>
+    · Sanitized — no internal IPs, registry IDs, or hostnames.
+  </div>
+</div>
+</body>
+</html>
