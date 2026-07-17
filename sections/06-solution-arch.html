@@ -48,17 +48,17 @@
   <div class="brand">DeepEP&nbsp;on&nbsp;EFA</div>
   <nav>
     <a href="../index.html">Overview</a>
-    <a href="01-what-is-moe.html">01 · What is DeepEP</a>
+    <a href="01-what-is-moe.html">01 · What is MoE</a>
     <a href="02-efa-vs-infiniband.html">02 · EFA vs IB</a>
-    <a href="03-scaling.html">03 · The stack</a>
-    <a href="04-microbenchmarks.html">04 · Measured results</a>
-    <a href="05-alternatives.html">05 · Frameworks</a>
-    <a href="06-solution-arch.html" style="color:var(--ink)">06 · Solution &amp; guidance</a>
-    <a href="07-the-math.html">7·The Math</a>
+    <a href="03-scaling.html">03 · Scaling</a>
+    <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+    <a href="05-alternatives.html">05 · Alternatives</a>
+    <a href="06-solution-arch.html" style="color:var(--ink)">06 · Solution Arch</a>
+    <a href="07-the-math.html">07 · The Math</a>
     <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
     <a href="09-public-repro.html">09 · Reproduce it</a>
     <a href="10-gpu-initiated-native.html">10 · GPU-initiated</a>
-    <a href="../calculator/">Calculator ▸</a>
+    <a href="../calculator/">Calculator</a>
   </nav>
 </header>
 
@@ -78,7 +78,7 @@
     utilization</b> <span class="pill m">measured</span>) and pays a fixed <b>+14.7&nbsp;ms/token</b>
     <span class="pill m">measured</span> per-decode-step tax that the all-to-all byte reduction cannot overcome.
     Use DeepEP on EFA for <b>capacity</b> (fitting a too-big model) or <b>framework fit</b> — not for a serving
-    speedup. A serving speedup requires <b>GPU-initiated transport</b>, which EFA does not expose today.
+    speedup. A serving speedup requires <b>GPU-initiated transport</b>, which no shipping EFA stack exposes today. <i>Update 2026-07-17: a native kernel-posted path (CQ-poll, no hardware counters) is now measured in <a href="10-gpu-initiated-native.html">§10</a> — it beats the proxy on dispatch/combine latency but remains a research path, not a serving recipe; this section's verdict is unchanged.</i>
     <b>On InfiniBand the calculus flips</b>: IBGDA posts the WQE from the kernel, removes the proxy tax, and
     DeepEP's transport win converts to a serving win.</p>
   </div>

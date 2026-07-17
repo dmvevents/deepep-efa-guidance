@@ -34,17 +34,17 @@
   <div class="brand">DeepEP&nbsp;on&nbsp;EFA</div>
   <nav>
     <a href="../index.html">Overview</a>
-    <a href="01-what-is-moe.html">1 · MoE</a>
-    <a href="02-efa-vs-infiniband.html" style="color:var(--ink)">2 · EFA vs IB</a>
-    <a href="03-scaling.html">3 · Scaling</a>
-    <a href="04-microbenchmarks.html">4 · Frameworks</a>
-    <a href="05-alternatives.html">5 · Tuning</a>
-    <a href="06-solution-arch.html">6 · Decision</a>
-    <a href="07-the-math.html">7·The Math</a>
+    <a href="01-what-is-moe.html">01 · What is MoE</a>
+    <a href="02-efa-vs-infiniband.html" style="color:var(--ink)">02 · EFA vs IB</a>
+    <a href="03-scaling.html">03 · Scaling</a>
+    <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+    <a href="05-alternatives.html">05 · Alternatives</a>
+    <a href="06-solution-arch.html">06 · Solution Arch</a>
+    <a href="07-the-math.html">07 · The Math</a>
     <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
     <a href="09-public-repro.html">09 · Reproduce it</a>
     <a href="10-gpu-initiated-native.html">10 · GPU-initiated</a>
-    <a href="../calculator/">Calculator ▸</a>
+    <a href="../calculator/">Calculator</a>
   </nav>
 </header>
 
@@ -322,7 +322,7 @@ t_op <span class="op">=</span> t_D2Hring <span class="op">+</span> t_proxypoll <
           The kernel-posted-WQE dispatch path is upstream-gated, not a config flag.</div>
   <p class="figcap">Combined with SRD's no-ordering / no-atomics, this is why <b>the proxy is mandatory on EFA
   today</b> for dispatch. GDAKI is the right answer architecturally — it is simply not a shipping option on this
-  fabric yet. Anyone telling you to "just turn on GPU-initiated dispatch on EFA" is describing InfiniBand.</p>
+  fabric yet. Anyone telling you to "just turn on GPU-initiated dispatch on EFA" is describing InfiniBand. <i>Update 2026-07-17: our §10 campaign measured a <b>counter-free</b> native variant (CQ-poll completion) that runs dispatch+combine correctly and beats the proxy — see <a href="10-gpu-initiated-native.html">§10</a>; the shipping-stack statement above still holds.</i></p>
 
   <!-- ============================================================ 6. STACK DIAGRAM ============================================================ -->
   <h2>6 · The two data paths, layer by layer</h2>
@@ -410,7 +410,7 @@ t_op <span class="op">=</span> t_D2Hring <span class="op">+</span> t_proxypoll <
     <b>Takeaway.</b> EFA and InfiniBand have comparable bandwidth (400 GB/s/node here), but MoE dispatch is
     issue-bound, not bandwidth-bound. On EFA today the CPU proxy adds a <b>fixed +14.7 ms/token</b> decode tax
     that is load-invariant and cannot be paid back by DeepEP's byte savings, because the wire is already 97.8%
-    idle. The only architectural fix — GDAKI kernel-posted WQE — works for barrier but not dispatch, and is gated
+    idle. The counter-based GDAKI backend — kernel-posted WQE with hardware completion counters — works for barrier but not dispatch, and is gated
     behind an unshipped three-layer stack plus SRD's missing ordering and atomics. On this fabric, the host proxy
     is mandatory for dispatch.
   </div>

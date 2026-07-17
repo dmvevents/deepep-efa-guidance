@@ -10,13 +10,13 @@
 <header class="site">
   <span class="brand">DeepEP-on-EFA Guidance</span>
   <nav>
-    <a href="index.html">Overview</a>
+    <a href="index.html" style="color:var(--ink)">Overview</a>
     <a href="sections/01-what-is-moe.html">1·MoE</a>
     <a href="sections/02-efa-vs-infiniband.html">2·EFA vs IB</a>
     <a href="sections/03-scaling.html">3·Scaling</a>
-    <a href="sections/04-microbenchmarks.html">4·Benchmarks</a>
+    <a href="sections/04-microbenchmarks.html">4·Microbench</a>
     <a href="sections/05-alternatives.html">5·Alternatives</a>
-    <a href="sections/06-solution-arch.html">6·Architecture</a>
+    <a href="sections/06-solution-arch.html">6·Solution Arch</a>
     <a href="sections/07-the-math.html">7·The Math</a>
     <a href="sections/08-v1-nvshmem-backend.html">8·V1 (NVSHMEM)</a>
     <a href="sections/09-public-repro.html">9·Reproduce</a>
@@ -31,7 +31,7 @@
   GPU-initiated networking. On InfiniBand + NVLink that is a real serving win. <b>On AWS EFA it is not</b> — and
   this site shows, with the math and the measured numbers, exactly why, where DeepEP still has value, what the
   alternatives are, and what would change the verdict. Built from a multi-week campaign: 3 frameworks served,
-  274 falsified hypotheses, a fair A/B across regimes.</p>
+  377 falsified hypotheses (ledger as of 2026-07-17), a fair A/B across regimes.</p>
 
   <h2>The one-paragraph answer</h2>
   <div class="panel">
@@ -42,7 +42,7 @@
     <b>issue-bound at ~2.2% NIC utilization</b>, paying a fixed <b>+14.7 ms/token</b> host round-trip that the
     all-to-all byte-reduction can't overcome. Use DeepEP for <b>capacity</b> (fitting a model that won't otherwise
     fit) or framework-fit — not for a serving speedup. That speedup needs <b>GPU-initiated transport (GDAKI/IBGDA)</b>,
-    which EFA does not expose today. <b>On InfiniBand the calculus flips.</b>
+    which EFA does not expose in any shipping stack today — though our §10 campaign has now <b>measured a native kernel-posted research path that beats the proxy</b> (dispatch 338.5 vs 391.6 µs) while staying ~2.5–2.9× off IB. <b>On InfiniBand the calculus flips.</b>
     <i>July 2026 update:</i> all of this is now reproducible from <b>public roots only</b> (§9), and one
     efficiency lever measurably converts — striping over 8 NCCL comms (<code>EP_NUM_COMMS=8</code>)
     <b class="good">doubles vLLM serving throughput</b> by attacking the issue-bound proxy directly. The

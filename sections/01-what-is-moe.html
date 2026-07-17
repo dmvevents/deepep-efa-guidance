@@ -11,14 +11,14 @@
 <header class="site">
   <span class="brand">DeepEP-on-EFA Guidance</span>
   <nav>
-    <a href="../index.html">index</a>
-    <a href="01-what-is-moe.html">1 · MoE</a>
-    <a href="02-efa-vs-infiniband.html">2 · EFA vs IB</a>
-    <a href="03-scaling.html">3 · Scaling</a>
-    <a href="04-microbenchmarks.html">4 · Microbench</a>
-    <a href="05-alternatives.html">5 · Alternatives</a>
-    <a href="06-solution-arch.html">6 · Solution Arch</a>
-    <a href="07-the-math.html">7·The Math</a>
+    <a href="../index.html">Overview</a>
+    <a href="01-what-is-moe.html" style="color:var(--ink)">01 · What is MoE</a>
+    <a href="02-efa-vs-infiniband.html">02 · EFA vs IB</a>
+    <a href="03-scaling.html">03 · Scaling</a>
+    <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+    <a href="05-alternatives.html">05 · Alternatives</a>
+    <a href="06-solution-arch.html">06 · Solution Arch</a>
+    <a href="07-the-math.html">07 · The Math</a>
     <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
     <a href="09-public-repro.html">09 · Reproduce it</a>
     <a href="10-gpu-initiated-native.html">10 · GPU-initiated</a>
@@ -409,7 +409,7 @@
   <div class="warnbox">
     <strong>The cliffhanger (resolved in §2):</strong> on AWS EFA, DeepEP <em>functionally</em> works —
     it serves real MoE inference on EFA in this project — but its all-to-all advantage <strong>does not
-    convert to serving throughput.</strong> Two facts collide: EFA has no GPU-initiated path (no IBGDA),
+    convert to serving throughput.</strong> Two facts collide: EFA ships no GPU-initiated path (no IBGDA),
     so DeepEP falls back to a CPU-proxy transport; and the all-to-all is not the serving bottleneck once
     the proxy per-message tax dominates. <strong>§2 shows the arithmetic of why.</strong>
   </div>
