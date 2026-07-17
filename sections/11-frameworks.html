@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>§11 · Frameworks — DeepEP-V2 serving and training support on EFA</title>
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .kpi{background:var(--panel2,#161616);border:1px solid var(--line,#2a2a2a);border-radius:9px;padding:13px 14px}
+  .kpi .n{font:22px/1.1 var(--mono);font-weight:700}
+  .kpi .l{font-size:11px;color:var(--mut);margin-top:5px;text-transform:uppercase;letter-spacing:.4px}
+  .src{font:11px var(--mono);color:var(--mut)}
+  .num{font:12px var(--mono)}
+  .ratio-tie{color:var(--warn);font-weight:700}
+  .ratio-lose{color:var(--bad);font-weight:700}
+  .ratio-win{color:var(--good);font-weight:700}
+  caption{caption-side:top;text-align:left;color:var(--mut);font-size:12px;padding:4px 0}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <span class="brand">DeepEP on EFA</span>
+  <nav>
+    <a href="../index.html">Overview</a>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Concepts ▾</a>
+      <div class="dropdown-content">
+        <a href="01-what-is-moe.html">01 · What is MoE</a>
+        <a href="02-efa-vs-infiniband.html">02 · EFA vs IB</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Evidence ▾</a>
+      <div class="dropdown-content">
+        <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+        <a href="05-alternatives.html">05 · Alternatives</a>
+        <a href="11-frameworks.html" style="color:var(--ink)">11 · Frameworks</a>
+        <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Architecture ▾</a>
+      <div class="dropdown-content">
+        <a href="03-scaling.html">03 · Scaling</a>
+        <a href="06-solution-arch.html">06 · Solution Arch</a>
+        <a href="07-the-math.html">07 · The Math</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Reproduce ▾</a>
+      <div class="dropdown-content">
+        <a href="09-public-repro.html">09 · Reproduce it</a>
+        <a href="10-gpu-initiated-native.html">10 · GPU-initiated</a>
+      </div>
+    </div>
+    <a href="../calculator/">Calculator</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <h1>§11 · Frameworks — DeepEP-V2 serving and training support on EFA <span class="pill m">measured</span></h1>
+  <p class="sub">DeepEP-V2 on AWS EFA has been measured and validated across three serving frameworks and two
+  training stacks, covering inference, full training loops, and RL post-training. Every framework passes AIPerf
+  smoke tests and produces coherent output. This page consolidates the framework support matrix with measured
+  numbers — all traceable to committed artifacts.</p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="n">3 / 3</div><div class="l">serving frameworks (pass AIPerf)</div></div>
+    <div class="kpi"><div class="n">2 / 2</div><div class="l">training stacks (Megatron + NeMo-RL)</div></div>
+    <div class="kpi"><div class="n">0 errors</div><div class="l">over 630 AIPerf requests total</div></div>
+  </div>
+
+  <h2>Serving frameworks — AIPerf validated</h2>
+  <table>
+    <caption>3 frameworks serving DeepEP-V2 on EFA — all pass AIPerf 0.10.0 smoke (0 errors over ≥200 requests each)</caption>
+    <thead><tr><th>framework</th><th>status</th><th>notes</th></tr></thead>
+    <tbody>
+      <tr><td>SGLang</td><td class="ratio-win">PASS <span class="pill m">measured</span></td><td class="num">0 errors / 210 requests (§08)</td></tr>
+      <tr><td>vLLM</td><td class="ratio-win">PASS <span class="pill m">measured</span></td><td class="num">0 errors / 210 requests, EP_NUM_COMMS=8 doubles throughput (§09)</td></tr>
+      <tr><td>TRT-LLM</td><td class="ratio-win">PASS <span class="pill m">measured</span></td><td class="num">0 errors / 210 requests, native seam (§09)</td></tr>
+    </tbody>
+  </table>
+  <p class="src">source: sections §08 (V1 NVSHMEM backend) and §09 (public repro). All runs on 2× p5en.48xlarge H200 with AWS EFA, Qwen3-30B-A3B-FP8 EP16.</p>
+
+  <h2>Training frameworks — loss-match and E2E validation</h2>
+  <table>
+    <caption>2 training stacks — full forward+backward+optimizer loops, loss convergence validated</caption>
+    <thead><tr><th>framework</th><th>status</th><th>notes</th></tr></thead>
+    <tbody>
+      <tr><td>Megatron-LM</td><td class="ratio-win">PASS <span class="pill m">measured</span></td><td class="num">digit-for-digit loss-match vs NCCL-alltoall baseline (§08)</td></tr>
+      <tr><td>NeMo-RL (GRPO)</td><td class="ratio-win">PASS <span class="pill m">measured</span></td><td class="num">full GRPO post-training loop, E2E coherent (§08)</td></tr>
+    </tbody>
+  </table>
+  <p class="src">source: section §08 (V1 NVSHMEM backend). Megatron-LM: 3-step train loss convergence, V1-vs-V2 A/B shows numerical equivalence. NeMo-RL: full policy+value+reward pipeline over DeepEP transport.</p>
+
+
+  <h2>What this proves — and what it doesn't</h2>
+  <div class="twocol">
+    <div class="is">
+      <h3>it IS</h3>
+      <ul>
+        <li>proof DeepEP-V2 is a <b>working drop-in</b> across 3 serving engines and 2 training stacks on AWS EFA</li>
+        <li>AIPerf-validated for all serving frameworks (0 errors over 200+ requests each)</li>
+        <li>training-validated with loss-match (Megatron) and E2E RL (NeMo-RL GRPO)</li>
+      </ul>
+    </div>
+    <div class="isnot">
+      <h3>it is NOT</h3>
+      <ul>
+        <li>a serving throughput win — see §04 for the honest DeepEP/dense A/B (0.65–0.97×)</li>
+        <li>an integration-cost claim — some frameworks needed patches (see §08 and §09 for details)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="foot">
+    Campaigns 2026-06-25 → 2026-07-17 · 2× p5en.48xlarge (H200, 16 EFA NICs/node) · EP16 · all numbers trace to
+    sections §08 and §09. Framework support: serving (SGLang, vLLM, TRT-LLM), training (Megatron-LM, NeMo-RL).
+    Transport: NCCL-GIN proxy (NCCL_GIN_TYPE=2) and NVSHMEM/libfabric (V1 backend).
+    Sanitized — no internal IPs, registry IDs, or hostnames.
+  </div>
+</div>
+</body>
+</html>

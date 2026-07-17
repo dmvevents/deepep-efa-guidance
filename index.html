@@ -11,16 +11,37 @@
   <span class="brand">DeepEP-on-EFA Guidance</span>
   <nav>
     <a href="index.html" style="color:var(--ink)">Overview</a>
-    <a href="sections/01-what-is-moe.html">1·MoE</a>
-    <a href="sections/02-efa-vs-infiniband.html">2·EFA vs IB</a>
-    <a href="sections/03-scaling.html">3·Scaling</a>
-    <a href="sections/04-microbenchmarks.html">4·Microbench</a>
-    <a href="sections/05-alternatives.html">5·Alternatives</a>
-    <a href="sections/06-solution-arch.html">6·Solution Arch</a>
-    <a href="sections/07-the-math.html">7·The Math</a>
-    <a href="sections/08-v1-nvshmem-backend.html">8·V1 (NVSHMEM)</a>
-    <a href="sections/09-public-repro.html">9·Reproduce</a>
-    <a href="sections/10-gpu-initiated-native.html">10·GPU-init</a>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Concepts ▾</a>
+      <div class="dropdown-content">
+        <a href="sections/01-what-is-moe.html">01 · What is MoE</a>
+        <a href="sections/02-efa-vs-infiniband.html">02 · EFA vs IB</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Evidence ▾</a>
+      <div class="dropdown-content">
+        <a href="sections/04-microbenchmarks.html">04 · Microbenchmarks</a>
+        <a href="sections/05-alternatives.html">05 · Alternatives</a>
+        <a href="sections/11-frameworks.html">11 · Frameworks</a>
+        <a href="sections/08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Architecture ▾</a>
+      <div class="dropdown-content">
+        <a href="sections/03-scaling.html">03 · Scaling</a>
+        <a href="sections/06-solution-arch.html">06 · Solution Arch</a>
+        <a href="sections/07-the-math.html">07 · The Math</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Reproduce ▾</a>
+      <div class="dropdown-content">
+        <a href="sections/09-public-repro.html">09 · Reproduce it</a>
+        <a href="sections/10-gpu-initiated-native.html">10 · GPU-initiated</a>
+      </div>
+    </div>
     <a href="calculator/">▸ Calculator</a>
   </nav>
 </header>
@@ -69,6 +90,7 @@
     <div class="card"><b>§3 · Scaling</b><div class="mut">Single vs multi-node, conc/world-size/expert sweeps — charts. <a href="sections/03-scaling.html">open →</a></div></div>
     <div class="card"><b>§4 · Microbenchmarks</b><div class="mut">Transport GB/s + real AIPerf inference numbers, sourced. <a href="sections/04-microbenchmarks.html">open →</a></div></div>
     <div class="card"><b>§5 · Alternatives</b><div class="mut">dense, UCCL, pplx, IBGDA — do they serve, how fast. <a href="sections/05-alternatives.html">open →</a></div></div>
+    <div class="card"><b>§11 · Frameworks</b><div class="mut">Framework support matrix: <b>3/3 serving</b> (SGLang, vLLM, TRT-LLM pass AIPerf), <b>2/2 training</b> (Megatron-LM, NeMo-RL GRPO E2E). Kimi-384 validation: 629.5 µs D+C micro-bench + ≤2.08e-4 MegatronBridge loss-match over model-dominated phase. Transport/dispatcher proven at production expert count, integration cost documented. <a href="sections/11-frameworks.html">open →</a></div></div>
     <div class="card"><b>§6 · Solution architecture</b><div class="mut">What works today + internal/customer decision trees. <a href="sections/06-solution-arch.html">open →</a></div></div>
     <div class="card"><b>§8 · DeepEP V1 (NVSHMEM backend)</b><div class="mut"><b>Campaign complete: four capstones</b> (vLLM, SGLang, Megatron, NeMo-RL GRPO) measured 2026-06-25 → 2026-07-08 — serving + training + full RL over the same NVSHMEM/EFA transport. SGLang <b>inverts</b> the vLLM result (LL wins via cuda-graph: 60–66 ms TPOT, decode c32 +50% tok/s). Megatron digit-for-digit numerics vs V2 (the only controlled cross-transport A/B). Integration cost: V1 needed <i>fewer</i> patches (SGLang stock, Megatron 0 commits, NeMo-RL 1-hunk). H200 A/B (ours vs AWS, ~2× prefill gap), decode LL handle-cache bug + 3.7.0 fix. <b>Gap-closure retest:</b> the vLLM LL-worse verdict was an eager artifact — cuda-graphed LL converges with SGLang (~60-65 ms) and edges dense 1.06-1.08× in decode. <a href="sections/08-v1-nvshmem-backend.html">open →</a></div></div>
     <div class="card"><b>§9 · Reproduce it (public roots)</b><div class="mut">The July 2026 re-run: all six gates from public upstreams + committed patches (<code>antonai-work/deepep-v2-efa-repro</code>). NEW: <b>EP_NUM_COMMS=8 multicomm doubles vLLM</b> (39.4/76.5/273.0 vs 19.5/38.8/144.6, ITL halved) — measured on the pure public stack. TRT-LLM native seam replaces the shim at zero cost. <a href="sections/09-public-repro.html">open →</a></div></div>

@@ -31,19 +31,40 @@
 <body>
 
 <header class="site">
-  <div class="brand">DeepEP&nbsp;on&nbsp;EFA</div>
+  <span class="brand">DeepEP on EFA</span>
   <nav>
     <a href="../index.html">Overview</a>
-    <a href="01-what-is-moe.html">01 · What is MoE</a>
-    <a href="02-efa-vs-infiniband.html" style="color:var(--ink)">02 · EFA vs IB</a>
-    <a href="03-scaling.html">03 · Scaling</a>
-    <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
-    <a href="05-alternatives.html">05 · Alternatives</a>
-    <a href="06-solution-arch.html">06 · Solution Arch</a>
-    <a href="07-the-math.html">07 · The Math</a>
-    <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
-    <a href="09-public-repro.html">09 · Reproduce it</a>
-    <a href="10-gpu-initiated-native.html">10 · GPU-initiated</a>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Concepts ▾</a>
+      <div class="dropdown-content">
+        <a href="01-what-is-moe.html">01 · What is MoE</a>
+        <a href="02-efa-vs-infiniband.html" style="color:var(--ink)">02 · EFA vs IB</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Evidence ▾</a>
+      <div class="dropdown-content">
+        <a href="04-microbenchmarks.html">04 · Microbenchmarks</a>
+        <a href="05-alternatives.html">05 · Alternatives</a>
+        <a href="11-frameworks.html">11 · Frameworks</a>
+        <a href="08-v1-nvshmem-backend.html">08 · V1 (NVSHMEM)</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Architecture ▾</a>
+      <div class="dropdown-content">
+        <a href="03-scaling.html">03 · Scaling</a>
+        <a href="06-solution-arch.html">06 · Solution Arch</a>
+        <a href="07-the-math.html">07 · The Math</a>
+      </div>
+    </div>
+    <div class="dropdown">
+      <a href="#" class="dropbtn">Reproduce ▾</a>
+      <div class="dropdown-content">
+        <a href="09-public-repro.html">09 · Reproduce it</a>
+        <a href="10-gpu-initiated-native.html">10 · GPU-initiated</a>
+      </div>
+    </div>
     <a href="../calculator/">Calculator</a>
   </nav>
 </header>
